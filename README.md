@@ -47,9 +47,13 @@ huawei display brightness 60         # set screen brightness
 huawei audio volume 50               # set volume
 huawei wifi toggle                   # toggle WiFi
 huawei camera status                 # camera module/HAL status
+huawei updates check                 # check status of known upstream bugs
+huawei updates add <github-url>      # track a custom GitHub issue
 ```
 
 Commands that write to hardware require `sudo`. Run `huawei help` for the full reference.
+
+`huawei updates check` polls GitHub for known open issues (webcam INT3472 fix, etc.), checks for kernel/package updates, and caches results for 6 hours. Use `--no-cache` to force a fresh fetch.
 
 ---
 
