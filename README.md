@@ -28,6 +28,31 @@ A one-shot setup script for getting Huawei MateBook hardware working on Ubuntu 2
 
 ---
 
+## CLI Utility
+
+`huawei-cli` is a day-to-day hardware management tool — separate from the one-shot setup script.
+
+```bash
+# Install
+sudo cp huawei-cli /usr/local/bin/huawei
+sudo chmod +x /usr/local/bin/huawei
+
+# Examples
+huawei status                        # full hardware report
+huawei battery threshold 80          # stop charging at 80%
+huawei battery threshold-persist 80  # persist across reboots
+huawei power set balanced            # change power profile
+huawei touchpad rebind               # fix frozen touchpad
+huawei display brightness 60         # set screen brightness
+huawei audio volume 50               # set volume
+huawei wifi toggle                   # toggle WiFi
+huawei camera status                 # camera module/HAL status
+```
+
+Commands that write to hardware require `sudo`. Run `huawei help` for the full reference.
+
+---
+
 ## Quick Start
 
 ```bash

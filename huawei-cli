@@ -1,0 +1,1106 @@
+#!/usr/bin/env bash
+# =============================================================================
+# huawei-cli — Hardware management utility for Huawei MateBook on Linux
+# Tested on: MateBook X Pro 2024 (VGHH-XX), Ubuntu 24.04, Kernel 6.17
+# Usage: huawei <command> [subcommand] [args]
+# Install: sudo cp huawei-cli /usr/local/bin/huawei && sudo chmod +x /usr/local/bin/huawei
+# =============================================================================
+
+set -euo pipefail
+
+# --- Colours -----------------------------------------------------------------
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+BLU='\033[0;34m'
+CYN='\033[0;36m'
+MAG='\033[0;35m'
+BLD='\033[1m'
+DIM='\033[2m'
+RST='\033[0m'
+
+# --- Output helpers ----------------------------------------------------------
+info()  { echo -e "${BLU}•${RST} $*"; }
+ok()    { echo -e "${GRN}✓${RST} $*"; }
+warn()  { echo -e "${YLW}!${RST} $*"; }
+err()   { echo -e "${RED}✗${RST} $*" >&2; }
+dim()   { echo -e "${DIM}$*${RST}"; }
+bold()  { echo -e "${BLD}$*${RST}"; }
+hdr()   { echo -e "\n${BLD}${CYN}$*${RST}"; }
+
+die() { err "$*"; exit 1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "This command requires root. Run with sudo."
+}
+
+# Numeric guard: is $1 a non-negative integer?
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Read a sysfs file, return empty string on failure
+sysread() { cat "$1" 2>/dev/null || true; }
+
+# Write to sysfs, die on failure
+syswrite() {
+    local path="$1" val="$2"
+    echo "$val" > "$path" 2>/dev/null || die "Cannot write '$val' to $path"
+}
+
+# =============================================================================
+# STATUS — full hardware report
+# =============================================================================
+cmd_status() {
+    local pad=32
+
+    _row() {
+        local label="$1" state="$2" note="${3:-}"
+        local sym col
+        case "$state" in
+            OK)      sym="✓"; col="$GRN" ;;
+            WARN)    sym="!"; col="$YLW" ;;
+            FAIL)    sym="✗"; col="$RED" ;;
+            *)       sym="?"; col="$CYN" ;;
+        esac
+        printf "  %-${pad}s %b%s %-6s%b %s\n" \
+            "$label" "$col" "$sym" "[$state]" "$RST" "$note"
+    }
+
+    local model kernel
+    model=$(sudo dmidecode -s system-product-name 2>/dev/null \
+        || dmidecode -s system-product-name 2>/dev/null \
+        || echo "unknown (run as root for model)")
+    kernel=$(uname -r)
+
+    echo ""
+    echo -e "${BLD}${CYN}╔══════════════════════════════════════════╗${RST}"
+    echo -e "${BLD}${CYN}║       Huawei MateBook Hardware Status    ║${RST}"
+    echo -e "${BLD}${CYN}╚══════════════════════════════════════════╝${RST}"
+    echo -e "  Model  : ${BLD}${model}${RST}"
+    echo -e "  Kernel : ${BLD}${kernel}${RST}"
+    echo ""
+
+    hdr "Input"
+    if grep -qi "GXTP7863" /proc/bus/input/devices 2>/dev/null; then
+        _row "Touchpad (GXTP7863)" "OK" "Detected"
+    else
+        _row "Touchpad (GXTP7863)" "FAIL" "Not detected — try: huawei touchpad rebind"
+    fi
+    if systemctl is-enabled touchpad-rebind.service &>/dev/null; then
+        _row "Touchpad rebind service" "OK" "Enabled at boot"
+    else
+        _row "Touchpad rebind service" "WARN" "Not enabled — run setup script"
+    fi
+
+    hdr "Power"
+    local bat_path
+    bat_path=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1 || true)
+    if [[ -n "$bat_path" ]]; then
+        local pct status thresh
+        pct=$(sysread "$bat_path/capacity")
+        status=$(sysread "$bat_path/status")
+        thresh=$(sysread "$bat_path/charge_control_end_threshold")
+        local note="${pct}%  ${status}"
+        [[ -n "$thresh" ]] && note+="  (threshold: ${thresh}%)"
+        _row "Battery" "OK" "$note"
+    else
+        _row "Battery" "UNKNOWN" "No battery found"
+    fi
+
+    if command -v powerprofilesctl &>/dev/null; then
+        local profile
+        profile=$(powerprofilesctl get 2>/dev/null || echo "unknown")
+        _row "Power profile" "OK" "$profile"
+    elif [[ -f /sys/firmware/acpi/platform_profile ]]; then
+        local profile
+        profile=$(sysread /sys/firmware/acpi/platform_profile)
+        _row "Power profile (ACPI)" "OK" "$profile"
+    else
+        _row "Power profile" "UNKNOWN" "power-profiles-daemon not found"
+    fi
+
+    hdr "Display"
+    local bl_path
+    bl_path=$(ls -d /sys/class/backlight/*/brightness 2>/dev/null | head -1 || true)
+    if [[ -n "$bl_path" ]]; then
+        local cur max pct_bl
+        cur=$(sysread "$bl_path")
+        max=$(sysread "${bl_path%brightness}max_brightness")
+        if [[ -n "$cur" && -n "$max" && "$max" -gt 0 ]]; then
+            pct_bl=$(( cur * 100 / max ))
+            _row "Backlight" "OK" "${pct_bl}%  (${cur}/${max})"
+        else
+            _row "Backlight" "OK" "Path found: $bl_path"
+        fi
+    else
+        _row "Backlight" "UNKNOWN" "No backlight sysfs path"
+    fi
+
+    local kb_path
+    kb_path=$(ls -d /sys/class/leds/*/brightness 2>/dev/null | grep -i "kbd\|keyboard\|backlight" | head -1 || true)
+    if [[ -n "$kb_path" ]]; then
+        local kb_val
+        kb_val=$(sysread "$kb_path")
+        _row "Keyboard backlight" "OK" "Level: $kb_val"
+    else
+        _row "Keyboard backlight" "UNKNOWN" "No LED sysfs entry found"
+    fi
+
+    hdr "Network"
+    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: no"; then
+        local ssid
+        ssid=$(iwgetid -r 2>/dev/null || echo "not associated")
+        _row "WiFi (Intel CNVi)" "OK" "$ssid"
+    elif rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+        _row "WiFi (Intel CNVi)" "WARN" "Soft-blocked (rfkill)"
+    else
+        _row "WiFi (Intel CNVi)" "UNKNOWN" "Check rfkill list"
+    fi
+
+    if rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: no"; then
+        _row "Bluetooth" "OK" "Enabled"
+    else
+        _row "Bluetooth" "WARN" "Disabled or blocked"
+    fi
+
+    hdr "Audio"
+    if systemctl --user is-active pipewire &>/dev/null 2>&1; then
+        local vol
+        vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print $2}' || echo "?")
+        _row "PipeWire" "OK" "Running  volume: ${vol}"
+    else
+        _row "PipeWire" "WARN" "Not active for current user"
+    fi
+
+    hdr "Camera"
+    if lsmod | grep -q "intel_ipu6"; then
+        _row "IPU6 kernel module" "OK" "intel_ipu6 loaded"
+    else
+        _row "IPU6 kernel module" "FAIL" "Not loaded"
+    fi
+    if [[ -f /usr/lib/libcamhal/plugins/ipu6epmtl.so ]]; then
+        _row "Camera HAL (ipu6epmtl)" "OK" "Plugin installed"
+    else
+        _row "Camera HAL (ipu6epmtl)" "FAIL" "Not installed — run setup script"
+    fi
+    if dmesg 2>/dev/null | grep -q "INT3472.*EBUSY"; then
+        _row "Camera streaming" "FAIL" "INT3472 GPIO conflict (upstream bug)"
+    else
+        _row "Camera streaming" "UNKNOWN" "Run: huawei camera test"
+    fi
+
+    _row "Fingerprint reader" "FAIL" "No Linux driver (Goodix — unsupported)"
+
+    echo ""
+}
+
+# =============================================================================
+# BATTERY
+# =============================================================================
+_bat_path() {
+    ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1 || true
+}
+
+cmd_battery() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            local bat
+            bat=$(_bat_path)
+            [[ -n "$bat" ]] || die "No battery found."
+
+            hdr "Battery"
+            local pct status health thresh_end thresh_start
+            pct=$(sysread "$bat/capacity")
+            status=$(sysread "$bat/status")
+            health=$(sysread "$bat/health" || echo "unknown")
+            thresh_end=$(sysread "$bat/charge_control_end_threshold" || true)
+            thresh_start=$(sysread "$bat/charge_control_start_threshold" || true)
+
+            echo -e "  Charge   : ${BLD}${pct}%${RST}"
+            echo -e "  Status   : $status"
+            echo -e "  Health   : $health"
+            [[ -n "$thresh_end"   ]] && echo -e "  Threshold: stop at ${thresh_end}%  start at ${thresh_start:-(auto)}%"
+
+            if command -v upower &>/dev/null; then
+                local udev
+                udev=$(upower -e 2>/dev/null | grep battery | head -1 || true)
+                if [[ -n "$udev" ]]; then
+                    echo ""
+                    upower -i "$udev" 2>/dev/null | grep -E "energy|time to|voltage|temperature" \
+                        | sed 's/^/  /'
+                fi
+            fi
+            ;;
+
+        threshold)
+            need_root
+            local val="${1:-}"
+            local bat
+            bat=$(_bat_path)
+            [[ -n "$bat" ]] || die "No battery found."
+
+            local thresh_path="$bat/charge_control_end_threshold"
+            [[ -f "$thresh_path" ]] || die "Charge threshold not supported on this kernel/driver."
+
+            if [[ -z "$val" ]]; then
+                local cur
+                cur=$(sysread "$thresh_path")
+                echo "Current charge threshold: ${cur}%"
+                echo "Usage: huawei battery threshold <50-100>"
+                return
+            fi
+
+            is_int "$val" || die "Threshold must be an integer (50–100)."
+            [[ "$val" -ge 50 && "$val" -le 100 ]] || die "Threshold must be between 50 and 100."
+
+            syswrite "$thresh_path" "$val"
+            ok "Charge threshold set to ${val}%"
+            warn "This setting resets on reboot. To persist it, run: huawei battery threshold-persist $val"
+            ;;
+
+        threshold-persist)
+            need_root
+            local val="${1:-}"
+            is_int "$val" || die "Usage: huawei battery threshold-persist <50-100>"
+            [[ "$val" -ge 50 && "$val" -le 100 ]] || die "Threshold must be between 50 and 100."
+
+            local bat
+            bat=$(_bat_path)
+            local bat_name
+            bat_name=$(basename "$bat")
+            local svc_file="/etc/systemd/system/huawei-battery-threshold.service"
+
+            cat > "$svc_file" << EOF
+[Unit]
+Description=Huawei MateBook battery charge threshold
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo ${val} > /sys/class/power_supply/${bat_name}/charge_control_end_threshold'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable --now huawei-battery-threshold.service
+            ok "Threshold ${val}% persisted via systemd service"
+            ;;
+
+        *)
+            err "Unknown battery subcommand: $sub"
+            echo "Usage: huawei battery {status|threshold [val]|threshold-persist <val>}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# POWER PROFILES
+# =============================================================================
+cmd_power() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    # Prefer power-profiles-daemon; fall back to ACPI platform profile
+    _get_profile() {
+        if command -v powerprofilesctl &>/dev/null; then
+            powerprofilesctl get 2>/dev/null
+        elif [[ -f /sys/firmware/acpi/platform_profile ]]; then
+            sysread /sys/firmware/acpi/platform_profile
+        else
+            echo "unavailable"
+        fi
+    }
+
+    _set_profile() {
+        local p="$1"
+        if command -v powerprofilesctl &>/dev/null; then
+            powerprofilesctl set "$p" && ok "Profile set to: $p"
+        elif [[ -f /sys/firmware/acpi/platform_profile ]]; then
+            need_root
+            syswrite /sys/firmware/acpi/platform_profile "$p"
+            ok "ACPI platform profile set to: $p"
+        else
+            die "No power profile mechanism found (install power-profiles-daemon)."
+        fi
+    }
+
+    case "$sub" in
+        status)
+            local cur avail
+            cur=$(_get_profile)
+            echo -e "  Current profile: ${BLD}${cur}${RST}"
+            if command -v powerprofilesctl &>/dev/null; then
+                echo ""
+                echo "  Available profiles:"
+                powerprofilesctl list 2>/dev/null | grep ":" | sed 's/^/    /'
+            elif [[ -f /sys/firmware/acpi/platform_profile_choices ]]; then
+                avail=$(sysread /sys/firmware/acpi/platform_profile_choices)
+                echo "  Available: $avail"
+            fi
+            ;;
+        set)
+            local profile="${1:-}"
+            [[ -n "$profile" ]] || die "Usage: huawei power set <balanced|performance|power-saver>"
+            _set_profile "$profile"
+            ;;
+        balanced)     _set_profile "balanced" ;;
+        performance)  _set_profile "performance" ;;
+        saver|powersave|power-saver) _set_profile "power-saver" ;;
+        *)
+            err "Unknown power subcommand: $sub"
+            echo "Usage: huawei power {status|set <profile>|balanced|performance|saver}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# TOUCHPAD
+# =============================================================================
+cmd_touchpad() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            hdr "Touchpad"
+            if grep -qi "GXTP7863" /proc/bus/input/devices 2>/dev/null; then
+                ok "GXTP7863 detected in /proc/bus/input"
+            else
+                err "GXTP7863 not detected"
+            fi
+
+            local quirk="/etc/libinput/local-overrides.quirks"
+            if grep -q "GXTP7863" "$quirk" 2>/dev/null; then
+                ok "libinput quirk present at $quirk"
+            else
+                warn "libinput quirk missing — run setup script"
+            fi
+
+            if systemctl is-enabled touchpad-rebind.service &>/dev/null; then
+                ok "touchpad-rebind.service enabled at boot"
+            else
+                warn "touchpad-rebind.service not enabled"
+            fi
+            ;;
+
+        rebind)
+            need_root
+            info "Unbinding GXTP7863 from i2c_hid_acpi..."
+            echo "i2c-GXTP7863:00" > /sys/bus/i2c/drivers/i2c_hid_acpi/unbind 2>/dev/null \
+                || warn "Unbind returned non-zero (device may already be unbound)"
+            sleep 1
+            info "Rebinding..."
+            echo "i2c-GXTP7863:00" > /sys/bus/i2c/drivers/i2c_hid_acpi/bind 2>/dev/null \
+                && ok "Touchpad rebound successfully" \
+                || warn "Rebind failed — reboot may be required"
+            ;;
+
+        *)
+            err "Unknown touchpad subcommand: $sub"
+            echo "Usage: huawei touchpad {status|rebind}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# DISPLAY
+# =============================================================================
+cmd_display() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    _bl_path() {
+        ls -d /sys/class/backlight/*/brightness 2>/dev/null | head -1 || true
+    }
+
+    _bl_max() {
+        local p
+        p=$(_bl_path)
+        [[ -n "$p" ]] && sysread "${p%brightness}max_brightness" || echo "0"
+    }
+
+    case "$sub" in
+        status|brightness)
+            local bl
+            bl=$(_bl_path)
+            if [[ -z "$bl" ]]; then
+                warn "No backlight sysfs path found."
+                return
+            fi
+            local cur max pct
+            cur=$(sysread "$bl")
+            max=$(sysread "${bl%brightness}max_brightness")
+            pct=$(( cur * 100 / max ))
+
+            if [[ "${sub}" == "status" ]]; then
+                hdr "Display"
+            fi
+
+            if [[ -z "${1:-}" ]]; then
+                echo -e "  Brightness: ${BLD}${pct}%${RST}  (raw ${cur} / ${max})"
+                echo "  Usage: huawei display brightness <0-100>"
+                return
+            fi
+
+            need_root
+            local val="$1"
+            is_int "$val" || die "Brightness must be 0–100."
+            [[ "$val" -le 100 ]] || die "Brightness must be 0–100."
+            local raw=$(( val * max / 100 ))
+            syswrite "$bl" "$raw"
+            ok "Brightness set to ${val}%  (raw $raw)"
+            ;;
+
+        *)
+            err "Unknown display subcommand: $sub"
+            echo "Usage: huawei display {status|brightness [0-100]}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# AUDIO
+# =============================================================================
+cmd_audio() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    _need_wpctl() {
+        command -v wpctl &>/dev/null || die "wpctl not found — is pipewire-utils installed?"
+    }
+
+    case "$sub" in
+        status)
+            _need_wpctl
+            hdr "Audio (PipeWire)"
+            if systemctl --user is-active pipewire &>/dev/null 2>&1; then
+                ok "PipeWire running"
+            else
+                warn "PipeWire not active for current user"
+            fi
+            echo ""
+            wpctl status 2>/dev/null | grep -A30 "Audio" | head -35
+            ;;
+
+        volume)
+            _need_wpctl
+            if [[ -z "${1:-}" ]]; then
+                wpctl get-volume @DEFAULT_AUDIO_SINK@
+                echo "Usage: huawei audio volume <0-100>|mute|unmute"
+                return
+            fi
+            case "$1" in
+                mute)   wpctl set-mute @DEFAULT_AUDIO_SINK@ 1 && ok "Muted" ;;
+                unmute) wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 && ok "Unmuted" ;;
+                toggle-mute) wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle && ok "Toggled mute" ;;
+                *)
+                    is_int "$1" || die "Volume must be 0–100, mute, or unmute."
+                    [[ "$1" -le 100 ]] || die "Volume must be 0–100."
+                    wpctl set-volume @DEFAULT_AUDIO_SINK@ "${1}%"
+                    ok "Volume set to ${1}%"
+                    ;;
+            esac
+            ;;
+
+        mute)         wpctl set-mute @DEFAULT_AUDIO_SINK@ 1 && ok "Muted" ;;
+        unmute)       wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 && ok "Unmuted" ;;
+
+        restart)
+            systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null && \
+                ok "PipeWire restarted" || warn "Restart had errors — check: systemctl --user status pipewire"
+            ;;
+
+        *)
+            err "Unknown audio subcommand: $sub"
+            echo "Usage: huawei audio {status|volume [0-100|mute|unmute]|mute|unmute|restart}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# WIFI
+# =============================================================================
+cmd_wifi() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            hdr "WiFi"
+            rfkill list wifi 2>/dev/null || echo "  rfkill: no wifi entry"
+            local ssid
+            ssid=$(iwgetid -r 2>/dev/null || echo "(not connected)")
+            echo -e "  SSID: ${BLD}${ssid}${RST}"
+            ;;
+        enable|on)
+            need_root
+            rfkill unblock wifi && ok "WiFi enabled"
+            ;;
+        disable|off)
+            need_root
+            rfkill block wifi && ok "WiFi disabled"
+            ;;
+        toggle)
+            need_root
+            if rfkill list wifi | grep -q "Soft blocked: no"; then
+                rfkill block wifi && ok "WiFi disabled"
+            else
+                rfkill unblock wifi && ok "WiFi enabled"
+            fi
+            ;;
+        *)
+            err "Unknown wifi subcommand: $sub"
+            echo "Usage: huawei wifi {status|enable|disable|toggle}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# BLUETOOTH
+# =============================================================================
+cmd_bluetooth() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            hdr "Bluetooth"
+            rfkill list bluetooth 2>/dev/null || echo "  rfkill: no bluetooth entry"
+            ;;
+        enable|on)
+            need_root
+            rfkill unblock bluetooth && ok "Bluetooth enabled"
+            ;;
+        disable|off)
+            need_root
+            rfkill block bluetooth && ok "Bluetooth disabled"
+            ;;
+        toggle)
+            need_root
+            if rfkill list bluetooth | grep -q "Soft blocked: no"; then
+                rfkill block bluetooth && ok "Bluetooth disabled"
+            else
+                rfkill unblock bluetooth && ok "Bluetooth enabled"
+            fi
+            ;;
+        *)
+            err "Unknown bluetooth subcommand: $sub"
+            echo "Usage: huawei bluetooth {status|enable|disable|toggle}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# CAMERA
+# =============================================================================
+cmd_camera() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            hdr "Camera"
+            if lsmod | grep -q "intel_ipu6"; then
+                ok "intel_ipu6 module loaded"
+            else
+                err "intel_ipu6 not loaded"
+            fi
+            if [[ -f /usr/lib/libcamhal/plugins/ipu6epmtl.so ]]; then
+                ok "Camera HAL plugin installed"
+            else
+                err "Camera HAL plugin missing"
+            fi
+            if dmesg 2>/dev/null | grep -q "INT3472.*EBUSY"; then
+                warn "INT3472 GPIO conflict detected in dmesg — streaming blocked (upstream bug)"
+                dim "  Track: https://github.com/intel/ipu6-drivers/issues/399"
+            else
+                info "No INT3472 error in dmesg (camera may be functional)"
+            fi
+            echo ""
+            info "V4L2 devices:"
+            ls /dev/video* 2>/dev/null | sed 's/^/  /' || echo "  None found"
+            ;;
+
+        test)
+            info "Testing camera pipeline via GStreamer (Ctrl+C to stop)..."
+            warn "This will fail on VGHH-XX while INT3472 bug is unresolved."
+            sudo -E gst-launch-1.0 icamerasrc ! fakesink 2>&1 | head -20
+            ;;
+
+        dmesg)
+            info "Camera-related kernel messages:"
+            dmesg 2>/dev/null | grep -iE "ipu6|INT3472|OV13B10|OV01A1S|icamera" | tail -30 | sed 's/^/  /'
+            ;;
+
+        *)
+            err "Unknown camera subcommand: $sub"
+            echo "Usage: huawei camera {status|test|dmesg}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# UPDATES — track known upstream issues and local fix status
+# =============================================================================
+
+# Cache TTL in seconds (default 6 hours; override with HUAWEI_CACHE_TTL)
+_CACHE_TTL="${HUAWEI_CACHE_TTL:-21600}"
+_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/huawei-cli"
+_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/huawei-cli"
+_USER_ISSUES_FILE="$_CONFIG_DIR/tracked-issues"
+
+# Built-in tracked items — format: "type:ref|label"
+#   type github  → ref = owner/repo/number
+#   type kernel  → ref = minimum kernel version where fix landed
+#   type package → ref = package name to check for updates
+#   type local   → ref = script function name
+_BUILTIN_ITEMS=(
+    "github:intel/ipu6-drivers/399|Camera: INT3472 GPIO conflict (VGHH-XX webcam blocked)"
+    "local:_check_fingerprint|Fingerprint: Goodix sensor Linux driver support"
+    "kernel:6.12|Kernel: minimum recommended for touchpad regression fix"
+    "package:linux-image-generic-hwe-24.04|Kernel: HWE track updates available"
+    "package:libcamhal-ipu6epmtl|Camera HAL: ipu6epmtl updates available"
+)
+
+# --- Cache helpers -----------------------------------------------------------
+_cache_key()  { echo "${1//\//_}" | tr ':' '_'; }
+
+_cache_read() {
+    local key
+    key=$(_cache_key "$1")
+    local f="$_CACHE_DIR/${key}.json" ts="$_CACHE_DIR/${key}.ts"
+    [[ -f "$f" && -f "$ts" ]] || return 1
+    local age=$(( $(date +%s) - $(cat "$ts") ))
+    [[ "$age" -lt "$_CACHE_TTL" ]] || return 1
+    cat "$f"
+}
+
+_cache_write() {
+    local key data
+    key=$(_cache_key "$1"); data="$2"
+    mkdir -p "$_CACHE_DIR"
+    echo "$data" > "$_CACHE_DIR/${key}.json"
+    date +%s      > "$_CACHE_DIR/${key}.ts"
+}
+
+# --- JSON field extractor (python3 — no jq dependency) ----------------------
+_jq() {
+    local field="$1"
+    python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    v=d.get('$field','')
+    print(v if v is not None else '')
+except Exception:
+    print('')
+"
+}
+
+# --- GitHub issue fetch ------------------------------------------------------
+# Returns: "STATE|TITLE|UPDATED_AT|COMMENTS|HTML_URL"
+_gh_issue() {
+    local owner="$1" repo="$2" number="$3"
+    local ref="$owner/$repo/$number"
+
+    local json
+    if ! json=$(_cache_read "$ref"); then
+        json=$(curl -sf --max-time 10 \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "User-Agent: huawei-cli/1.0" \
+            "https://api.github.com/repos/${owner}/${repo}/issues/${number}") \
+            || { echo "FETCH_ERROR|||"; return 1; }
+        _cache_write "$ref" "$json"
+    fi
+
+    local state title updated comments url
+    state=$(   echo "$json" | _jq state)
+    title=$(   echo "$json" | _jq title)
+    updated=$( echo "$json" | _jq updated_at)
+    comments=$(echo "$json" | _jq comments)
+    url=$(     echo "$json" | _jq html_url)
+
+    echo "${state}|${title}|${updated}|${comments}|${url}"
+}
+
+# --- Render a single issue row -----------------------------------------------
+_show_gh_item() {
+    local ref="$1" label="$2"
+    local owner repo number
+    IFS='/' read -r owner repo number <<< "$ref"
+
+    echo -e "\n  ${BLD}${label}${RST}"
+    dim "  github.com/${owner}/${repo}/issues/${number}"
+
+    local result
+    if ! result=$(_gh_issue "$owner" "$repo" "$number"); then
+        warn "  Could not fetch — check your internet connection"
+        return
+    fi
+
+    local state title updated comments url
+    IFS='|' read -r state title updated comments url <<< "$result"
+
+    local state_col state_sym
+    case "$state" in
+        closed) state_col="$GRN"; state_sym="✓ closed" ;;
+        open)   state_col="$RED"; state_sym="● open"   ;;
+        *)      state_col="$CYN"; state_sym="? $state"  ;;
+    esac
+
+    echo -e "  Status  : ${state_col}${BLD}${state_sym}${RST}"
+    [[ -n "$title"    ]] && echo -e "  Title   : $title"
+    [[ -n "$updated"  ]] && echo -e "  Updated : ${updated%T*}"
+    [[ -n "$comments" ]] && echo -e "  Comments: $comments"
+    [[ -n "$url"      ]] && dim "  $url"
+}
+
+# --- Local checks ------------------------------------------------------------
+_check_fingerprint() {
+    echo -e "\n  ${BLD}Fingerprint: Goodix sensor Linux driver support${RST}"
+
+    # Find fingerprint USB device (Goodix VID = 27c6, common MateBook PIDs)
+    local fp_usb
+    fp_usb=$(lsusb 2>/dev/null | grep -i "27c6" || true)
+
+    if [[ -z "$fp_usb" ]]; then
+        dim "  No Goodix USB fingerprint device found on USB bus"
+        return
+    fi
+
+    echo -e "  Device  : $fp_usb"
+
+    # Extract VID:PID for libfprint check
+    local vidpid
+    vidpid=$(echo "$fp_usb" | grep -oP '27c6:[0-9a-fA-F]{4}' | head -1)
+
+    # Check if fprintd sees any enrolled/available devices
+    if command -v fprintd-list &>/dev/null; then
+        local fp_out
+        fp_out=$(fprintd-list "$USER" 2>&1 || true)
+        if echo "$fp_out" | grep -qi "no devices"; then
+            echo -e "  Status  : ${RED}${BLD}● not supported${RST}  (fprintd: no devices)"
+        elif echo "$fp_out" | grep -qi "error\|no enrolled"; then
+            echo -e "  Status  : ${YLW}${BLD}! driver present but no enrolled fingers${RST}"
+        else
+            echo -e "  Status  : ${GRN}${BLD}✓ may be working — check fprintd-list${RST}"
+        fi
+    else
+        echo -e "  Status  : ${YLW}! fprintd not installed — cannot check${RST}"
+    fi
+
+    # Check libfprint supported device list
+    local fp_lib
+    fp_lib=$(find /usr/lib -name "libfprint*.so*" 2>/dev/null | head -1)
+    if [[ -n "$vidpid" && -n "$fp_lib" ]]; then
+        if strings "$fp_lib" 2>/dev/null | grep -qi "${vidpid,,}"; then
+            ok "  $vidpid found in libfprint device strings"
+        else
+            warn "  $vidpid not found in libfprint — driver likely missing"
+        fi
+    fi
+
+    dim "  libfprint issues: https://gitlab.freedesktop.org/libfprint/libfprint/-/issues"
+}
+
+# --- Kernel version check ----------------------------------------------------
+_show_kernel_item() {
+    local min_ver="$1" label="$2"
+    echo -e "\n  ${BLD}${label}${RST}"
+    local running
+    running=$(uname -r | grep -oP '^\d+\.\d+')
+    local min_major min_minor run_major run_minor
+    IFS='.' read -r min_major min_minor <<< "$min_ver"
+    IFS='.' read -r run_major run_minor <<< "$running"
+
+    echo -e "  Running : $running  (minimum: $min_ver)"
+
+    if [[ "$run_major" -gt "$min_major" ]] || \
+       { [[ "$run_major" -eq "$min_major" ]] && [[ "$run_minor" -ge "$min_minor" ]]; }; then
+        ok "  Kernel meets minimum requirement"
+    else
+        warn "  Kernel ${running} is below minimum ${min_ver} — consider upgrading"
+    fi
+}
+
+# --- Package update check ----------------------------------------------------
+_show_package_item() {
+    local pkg="$1" label="$2"
+    echo -e "\n  ${BLD}${label}${RST}"
+
+    if ! dpkg -l "$pkg" &>/dev/null; then
+        warn "  $pkg is not installed"
+        return
+    fi
+
+    local installed available
+    installed=$(dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}')
+    echo -e "  Installed: $installed"
+
+    # Check apt cache for newer version (no network hit if cache is stale)
+    available=$(apt-cache policy "$pkg" 2>/dev/null \
+        | awk '/Candidate:/{print $2}')
+
+    if [[ -n "$available" && "$available" != "$installed" ]]; then
+        echo -e "  Available: ${YLW}${BLD}$available${RST}  ← update available"
+        dim "  Run: sudo apt install $pkg"
+    else
+        ok "  Up to date${available:+  ($available)}"
+    fi
+}
+
+# --- Load user-defined issues ------------------------------------------------
+_user_items() {
+    [[ -f "$_USER_ISSUES_FILE" ]] || return 0
+    grep -v '^\s*#' "$_USER_ISSUES_FILE" | grep -v '^\s*$' || true
+}
+
+# --- Parse a GitHub URL into owner/repo/number -------------------------------
+_parse_gh_url() {
+    local url="$1"
+    # Accept:  https://github.com/owner/repo/issues/123
+    #          github.com/owner/repo/issues/123
+    #          owner/repo#123  or  owner/repo/123
+    url="${url#https://github.com/}"
+    url="${url#github.com/}"
+    # owner/repo/issues/N or owner/repo#N
+    if [[ "$url" =~ ^([^/]+)/([^/]+)/issues/([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+    elif [[ "$url" =~ ^([^/]+)/([^#]+)#([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+    else
+        echo ""
+    fi
+}
+
+# --- Main updates command ----------------------------------------------------
+cmd_updates() {
+    local sub="${1:-check}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        check|c)
+            local no_cache=false
+            [[ "${1:-}" == "--no-cache" || "${1:-}" == "-f" ]] && no_cache=true
+
+            if $no_cache; then
+                rm -rf "$_CACHE_DIR"
+                info "Cache cleared — fetching fresh data..."
+            fi
+
+            hdr "Upstream Issue Tracker"
+            local user_count=0
+            [[ -f "$_USER_ISSUES_FILE" ]] && user_count=$(grep -c '.' "$_USER_ISSUES_FILE" 2>/dev/null || echo 0)
+            echo -e "  ${DIM}Checking ${#_BUILTIN_ITEMS[@]} built-in items + ${user_count} user items${RST}"
+            echo -e "  ${DIM}Cache TTL: $(( _CACHE_TTL / 3600 ))h  |  Clear with: huawei updates check --no-cache${RST}"
+
+            # Built-in items
+            for item in "${_BUILTIN_ITEMS[@]}"; do
+                local type_ref label
+                IFS='|' read -r type_ref label <<< "$item"
+                local itype iref
+                IFS=':' read -r itype iref <<< "$type_ref"
+
+                case "$itype" in
+                    github)  _show_gh_item "$iref" "$label" ;;
+                    kernel)  _show_kernel_item "$iref" "$label" ;;
+                    package) _show_package_item "$iref" "$label" ;;
+                    local)   "$iref" ;;
+                esac
+            done
+
+            # User-defined items
+            local user_items
+            mapfile -t user_items < <(_user_items)
+            for line in "${user_items[@]}"; do
+                local ref label
+                IFS='|' read -r ref label <<< "$line"
+                label="${label:-$ref}"
+                local parsed
+                parsed=$(_parse_gh_url "$ref")
+                if [[ -n "$parsed" ]]; then
+                    _show_gh_item "$parsed" "$label"
+                else
+                    warn "Cannot parse issue ref: $ref"
+                fi
+            done
+
+            echo ""
+            ;;
+
+        add)
+            local url="${1:-}"
+            [[ -n "$url" ]] || die "Usage: huawei updates add <github-issue-url> [label]"
+            local label="${2:-}"
+
+            local parsed
+            parsed=$(_parse_gh_url "$url")
+            [[ -n "$parsed" ]] || die "Could not parse GitHub issue URL: $url"
+
+            mkdir -p "$_CONFIG_DIR"
+            local line="${url}"
+            [[ -n "$label" ]] && line="${url}|${label}"
+            echo "$line" >> "$_USER_ISSUES_FILE"
+            ok "Added: $line"
+            dim "  Stored in $_USER_ISSUES_FILE"
+            ;;
+
+        remove|rm)
+            local url="${1:-}"
+            [[ -n "$url" ]] || die "Usage: huawei updates remove <github-issue-url>"
+            [[ -f "$_USER_ISSUES_FILE" ]] || die "No user issues file found."
+            local escaped="${url//\//\\/}"
+            sed -i "/^${escaped}/d" "$_USER_ISSUES_FILE"
+            ok "Removed entries matching: $url"
+            ;;
+
+        list|ls)
+            hdr "Tracked Issues"
+            echo -e "  ${BLD}Built-in:${RST}"
+            for item in "${_BUILTIN_ITEMS[@]}"; do
+                local type_ref label
+                IFS='|' read -r type_ref label <<< "$item"
+                echo -e "    ${DIM}${type_ref}${RST}  $label"
+            done
+            echo -e "\n  ${BLD}User-defined${RST}  (${_USER_ISSUES_FILE}):"
+            if [[ -f "$_USER_ISSUES_FILE" ]] && [[ -s "$_USER_ISSUES_FILE" ]]; then
+                grep -v '^\s*#' "$_USER_ISSUES_FILE" | sed 's/^/    /'
+            else
+                dim "    (none — use: huawei updates add <github-url>)"
+            fi
+            echo ""
+            ;;
+
+        cache)
+            local action="${1:-status}"
+            case "$action" in
+                clear) rm -rf "$_CACHE_DIR" && ok "Cache cleared" ;;
+                status)
+                    if [[ -d "$_CACHE_DIR" ]]; then
+                        local count
+                        count=$(ls "$_CACHE_DIR"/*.json 2>/dev/null | wc -l)
+                        echo -e "  Cache dir  : $_CACHE_DIR"
+                        echo -e "  Entries    : $count"
+                        echo -e "  TTL        : $(( _CACHE_TTL / 3600 ))h  (override: HUAWEI_CACHE_TTL)"
+                    else
+                        dim "  No cache yet."
+                    fi
+                    ;;
+            esac
+            ;;
+
+        *)
+            err "Unknown updates subcommand: $sub"
+            echo "Usage: huawei updates {check [--no-cache]|add <url> [label]|remove <url>|list|cache}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# INFO — system & model details
+# =============================================================================
+cmd_info() {
+    hdr "System Information"
+    echo -e "  Model    : ${BLD}$(dmidecode -s system-product-name 2>/dev/null || echo unknown)${RST}"
+    echo -e "  BIOS     : $(dmidecode -s bios-version 2>/dev/null || echo unknown)"
+    echo -e "  Kernel   : $(uname -r)"
+    echo -e "  CPU      : $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+    echo -e "  Memory   : $(free -h | awk '/^Mem:/{print $2}') RAM"
+    echo -e "  Uptime   : $(uptime -p)"
+
+    hdr "Kernel Modules"
+    local mods=(intel_ipu6 i2c_hid_acpi xe i915 snd_hda_intel btintel iwlwifi)
+    for m in "${mods[@]}"; do
+        if lsmod | grep -q "^${m}"; then
+            ok "$m"
+        else
+            dim "  - $m (not loaded)"
+        fi
+    done
+
+    hdr "PCI Devices (relevant)"
+    lspci 2>/dev/null | grep -iE "display|audio|wireless|bluetooth|camera|thunderbolt" \
+        | sed 's/^/  /' || echo "  lspci not available"
+}
+
+# =============================================================================
+# HELP
+# =============================================================================
+cmd_help() {
+    echo ""
+    bold "  huawei — Huawei MateBook hardware CLI"
+    dim   "  MateBook X Pro 2024 · Ubuntu 24.04 · Kernel 6.x"
+    echo ""
+    echo -e "  ${BLD}Usage:${RST} huawei <command> [subcommand] [args]"
+    echo ""
+    echo -e "  ${BLD}Commands:${RST}"
+    echo -e "    ${CYN}status${RST}                         Full hardware status report"
+    echo -e "    ${CYN}battery${RST} status                 Battery charge and health"
+    echo -e "    ${CYN}battery${RST} threshold [50-100]     Get/set charge stop threshold"
+    echo -e "    ${CYN}battery${RST} threshold-persist <n>  Persist threshold via systemd"
+    echo -e "    ${CYN}power${RST}   status                 Current power profile"
+    echo -e "    ${CYN}power${RST}   set <profile>          Set balanced|performance|power-saver"
+    echo -e "    ${CYN}touchpad${RST} status                Touchpad detection and quirks"
+    echo -e "    ${CYN}touchpad${RST} rebind                Force i2c rebind (fixes freezes)"
+    echo -e "    ${CYN}display${RST} brightness [0-100]     Get/set screen brightness"
+    echo -e "    ${CYN}audio${RST}   status                 PipeWire status"
+    echo -e "    ${CYN}audio${RST}   volume [0-100|mute]    Get/set volume"
+    echo -e "    ${CYN}audio${RST}   restart                Restart PipeWire stack"
+    echo -e "    ${CYN}wifi${RST}    status/enable/disable/toggle"
+    echo -e "    ${CYN}bluetooth${RST} status/enable/disable/toggle"
+    echo -e "    ${CYN}camera${RST}  status                 Camera module/HAL status"
+    echo -e "    ${CYN}camera${RST}  test                   Run GStreamer test pipeline"
+    echo -e "    ${CYN}camera${RST}  dmesg                  Camera kernel log messages"
+    echo -e "    ${CYN}info${RST}                           System + module info"
+    echo -e "    ${CYN}updates${RST} check                  Check status of known upstream issues"
+    echo -e "    ${CYN}updates${RST} check --no-cache        Force fresh fetch"
+    echo -e "    ${CYN}updates${RST} add <github-url>        Track a custom GitHub issue"
+    echo -e "    ${CYN}updates${RST} remove <github-url>     Stop tracking an issue"
+    echo -e "    ${CYN}updates${RST} list                    List all tracked issues"
+    echo ""
+    echo -e "  ${DIM}Commands that modify hardware require sudo.${RST}"
+    echo ""
+}
+
+# =============================================================================
+# Main dispatcher
+# =============================================================================
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        status|s)               cmd_status "$@" ;;
+        battery|bat|b)          cmd_battery "$@" ;;
+        power|pwr|p)            cmd_power "$@" ;;
+        touchpad|tp)            cmd_touchpad "$@" ;;
+        display|disp|screen)    cmd_display "$@" ;;
+        audio|sound|a)          cmd_audio "$@" ;;
+        wifi|wlan|w)            cmd_wifi "$@" ;;
+        bluetooth|bt)           cmd_bluetooth "$@" ;;
+        camera|cam)             cmd_camera "$@" ;;
+        info|i)                 cmd_info "$@" ;;
+        updates|up|u)           cmd_updates "$@" ;;
+        help|-h|--help)         cmd_help ;;
+        *)
+            err "Unknown command: $cmd"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
