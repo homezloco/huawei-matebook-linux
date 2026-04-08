@@ -458,9 +458,110 @@ cmd_display() {
             ok "Brightness set to ${val}%  (raw $raw)"
             ;;
 
+        scale)
+            # HiDPI fractional scaling via gsettings (GNOME/Wayland)
+            command -v gsettings &>/dev/null || die "gsettings not found — GNOME required"
+            if [[ -z "${1:-}" ]]; then
+                local cur_scale
+                cur_scale=$(gsettings get org.gnome.desktop.interface scaling-factor 2>/dev/null || echo "?")
+                local cur_text
+                cur_text=$(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null || echo "?")
+                echo -e "  Scaling factor      : ${BLD}${cur_scale}${RST}"
+                echo -e "  Text scaling factor : ${BLD}${cur_text}${RST}"
+                echo ""
+                dim "  Usage: huawei display scale <1|1.25|1.5|1.75|2>"
+                dim "  For fractional scaling, also enable:"
+                dim "    gsettings set org.gnome.mutter experimental-features \"['scale-monitor-framebuffer']\""
+                return
+            fi
+            local val="$1"
+            # Accept integer or decimal
+            [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "Scale must be a number e.g. 1.5"
+            gsettings set org.gnome.desktop.interface scaling-factor 1
+            gsettings set org.gnome.desktop.interface text-scaling-factor "$val"
+            # Enable fractional scaling in Mutter if <> 1
+            if [[ "$val" != "1" && "$val" != "2" ]]; then
+                gsettings set org.gnome.mutter experimental-features \
+                    "['scale-monitor-framebuffer']" 2>/dev/null || true
+            fi
+            ok "Display scale set to ${val}×"
+            warn "Log out and back in for the change to take full effect"
+            ;;
+
+        night-light|nightlight|nl)
+            command -v busctl &>/dev/null || die "busctl not found"
+            local action="${1:-status}"
+            case "$action" in
+                status)
+                    local enabled
+                    enabled=$(gsettings get org.gnome.settings-daemon.plugins.color \
+                        night-light-enabled 2>/dev/null || echo "?")
+                    local temp
+                    temp=$(gsettings get org.gnome.settings-daemon.plugins.color \
+                        night-light-temperature 2>/dev/null || echo "?")
+                    echo -e "  Night light: ${BLD}${enabled}${RST}"
+                    echo -e "  Temperature: ${BLD}${temp}${RST}K"
+                    ;;
+                on|enable)
+                    gsettings set org.gnome.settings-daemon.plugins.color \
+                        night-light-enabled true
+                    ok "Night light enabled"
+                    ;;
+                off|disable)
+                    gsettings set org.gnome.settings-daemon.plugins.color \
+                        night-light-enabled false
+                    ok "Night light disabled"
+                    ;;
+                temp|temperature)
+                    local t="${2:-4000}"
+                    is_int "$t" || die "Temperature must be an integer (1000–6500K)"
+                    [[ "$t" -ge 1000 && "$t" -le 6500 ]] || die "Range: 1000–6500K"
+                    gsettings set org.gnome.settings-daemon.plugins.color \
+                        night-light-temperature "$t"
+                    ok "Night light temperature set to ${t}K"
+                    ;;
+                *)
+                    err "Unknown night-light action: $action"
+                    echo "Usage: huawei display night-light {status|on|off|temp <1000-6500>}"
+                    ;;
+            esac
+            ;;
+
+        color-profile|icc)
+            # Import an ICC profile and assign it to the primary display
+            local icc="${1:-}"
+            if [[ -z "$icc" ]]; then
+                echo -e "  ${BLD}Active ICC profiles (colormgr):${RST}"
+                colormgr get-devices 2>/dev/null | grep -A5 "display" | sed 's/^/  /' \
+                    || dim "  colormgr not available (install colord)"
+                echo ""
+                dim "  Usage: huawei display color-profile <path-to-file.icc>"
+                dim "  Huawei Windows ICC: extract from Windows drivers or"
+                dim "    C:\\Windows\\System32\\spool\\drivers\\color\\"
+                return
+            fi
+            [[ -f "$icc" ]] || die "File not found: $icc"
+            command -v colormgr &>/dev/null || die "colormgr not found — install colord"
+            colormgr import-profile "$icc" && ok "ICC profile imported"
+            local device_id
+            device_id=$(colormgr get-devices 2>/dev/null \
+                | awk '/Device ID.*xrandr/{print $NF; exit}')
+            if [[ -n "$device_id" ]]; then
+                local profile_id
+                profile_id=$(colormgr get-profiles 2>/dev/null \
+                    | grep -A2 "$(basename "$icc")" | awk '/Profile ID/{print $NF}' | head -1)
+                [[ -n "$profile_id" ]] && \
+                    colormgr device-add-profile "$device_id" "$profile_id" && \
+                    colormgr device-make-profile-default "$device_id" "$profile_id" && \
+                    ok "ICC profile assigned to display"
+            else
+                warn "Profile imported but could not auto-assign — open GNOME Color settings to assign manually"
+            fi
+            ;;
+
         *)
             err "Unknown display subcommand: $sub"
-            echo "Usage: huawei display {status|brightness [0-100]}"
+            echo "Usage: huawei display {status|brightness [0-100]|scale [factor]|night-light [on|off|temp K]|color-profile [file.icc]}"
             exit 1
             ;;
     esac
@@ -1037,6 +1138,460 @@ cmd_info() {
 }
 
 # =============================================================================
+# THERMAL — CPU temperatures, fan speeds, throttle detection
+# =============================================================================
+cmd_thermal() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    # Find all hwmon devices with a name file
+    _hwmon_dirs() { ls -d /sys/class/hwmon/hwmon* 2>/dev/null || true; }
+
+    _hwmon_name() { sysread "$1/name"; }
+
+    # Millidegrees → degrees
+    _mdeg() { awk "BEGIN{printf \"%.1f\", $1/1000}"; }
+
+    case "$sub" in
+        status)
+            hdr "Thermal"
+
+            # --- CPU temperatures via coretemp / acpitz / intel_pch_thermal ---
+            local printed_temp=false
+            for hw in $(_hwmon_dirs); do
+                local name
+                name=$(_hwmon_name "$hw")
+                case "$name" in
+                    coretemp|acpitz|intel_pch_thermal|iwlwifi_1|BAT*)
+                        for inp in "$hw"/temp*_input; do
+                            [[ -f "$inp" ]] || continue
+                            local raw label labelfile
+                            raw=$(sysread "$inp")
+                            labelfile="${inp/_input/_label}"
+                            label=$(sysread "$labelfile")
+                            label="${label:-$name}"
+                            local deg
+                            deg=$(_mdeg "$raw")
+                            # Colour-code: green <70, yellow <85, red >=85
+                            local col="$GRN"
+                            (( ${raw%.*} >= 70000 )) && col="$YLW"
+                            (( ${raw%.*} >= 85000 )) && col="$RED"
+                            printf "  %-30s %b%s°C%b\n" "$label" "$col" "$deg" "$RST"
+                            printed_temp=true
+                        done
+                        ;;
+                esac
+            done
+            $printed_temp || warn "No temperature sensors found via hwmon"
+
+            # --- Fan speeds ---
+            echo ""
+            local printed_fan=false
+            for hw in $(_hwmon_dirs); do
+                local hwname
+                hwname=$(_hwmon_name "$hw")
+                local fannum=0
+                for fan in "$hw"/fan*_input; do
+                    [[ -f "$fan" ]] || continue
+                    (( fannum++ )) || true
+                    local rpm labelfile label
+                    rpm=$(sysread "$fan")
+                    # Skip fans with no reading or 0 RPM (not present / stopped)
+                    [[ -n "$rpm" && "$rpm" -gt 0 ]] 2>/dev/null || continue
+                    labelfile="${fan/_input/_label}"
+                    label=$(sysread "$labelfile")
+                    # Fall back to "hwmon_name fan N" if label is empty
+                    [[ -n "$label" ]] || label="${hwname} fan ${fannum}"
+                    printf "  %-30s %s RPM\n" "$label" "$rpm"
+                    printed_fan=true
+                done
+            done
+            $printed_fan || dim "  No fan speed sensors found (or fans stopped)"
+
+            # --- CPU frequency ---
+            echo ""
+            local min_mhz=999999 max_mhz=0 hw_max_mhz=0
+            for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+                [[ -f "$f" ]] || continue
+                local khz
+                khz=$(sysread "$f")
+                local mhz=$(( khz / 1000 ))
+                (( mhz < min_mhz )) && min_mhz=$mhz
+                (( mhz > max_mhz )) && max_mhz=$mhz
+            done
+            local hw_max_f="/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
+            [[ -f "$hw_max_f" ]] && hw_max_mhz=$(( $(sysread "$hw_max_f") / 1000 ))
+
+            if [[ "$max_mhz" -gt 0 ]]; then
+                printf "  %-30s %d – %d MHz" "CPU frequency (all cores)" "$min_mhz" "$max_mhz"
+                [[ "$hw_max_mhz" -gt 0 ]] && printf "  (hw max: %d MHz)" "$hw_max_mhz"
+                echo ""
+            fi
+
+            # Turbo / no_turbo flag
+            local no_turbo_f="/sys/devices/system/cpu/intel_pstate/no_turbo"
+            if [[ -f "$no_turbo_f" ]]; then
+                local nt
+                nt=$(sysread "$no_turbo_f")
+                if [[ "$nt" == "1" ]]; then
+                    warn "Intel turbo boost is OFF  (no_turbo=1)"
+                    dim "  Enable: echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo"
+                else
+                    ok "Intel turbo boost enabled"
+                fi
+            fi
+            ;;
+
+        watch)
+            local interval="${1:-2}"
+            is_int "$interval" || interval=2
+            echo -e "  ${DIM}Refreshing every ${interval}s — Ctrl+C to stop${RST}"
+            while true; do
+                clear
+                cmd_thermal status
+                sleep "$interval"
+            done
+            ;;
+
+        *)
+            err "Unknown thermal subcommand: $sub"
+            echo "Usage: huawei thermal {status|watch [interval_secs]}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# KEYBOARD — backlight control
+# =============================================================================
+cmd_keyboard() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    # Discover keyboard backlight LED — try known paths in order
+    _kb_led() {
+        local candidates=(
+            /sys/class/leds/huawei::kbd_backlight
+            /sys/class/leds/huawei-wmi::kbd_backlight
+            /sys/class/leds/ite829x::kbd_backlight
+            /sys/class/leds/ite8291::kbd_backlight
+        )
+        # Also scan dynamically
+        for d in /sys/class/leds/*/brightness; do
+            local parent="${d%/brightness}"
+            local name
+            name=$(basename "$parent")
+            case "${name,,}" in *kbd*|*keyboard*|*backlight*) candidates+=("$parent") ;; esac
+        done
+        for c in "${candidates[@]}"; do
+            [[ -f "$c/brightness" ]] && { echo "$c"; return; }
+        done
+        echo ""
+    }
+
+    case "$sub" in
+        status)
+            hdr "Keyboard Backlight"
+            local led
+            led=$(_kb_led)
+            if [[ -z "$led" ]]; then
+                warn "No keyboard backlight LED found in /sys/class/leds/"
+                dim "  Huawei WMI module may need loading: sudo modprobe huawei_wmi"
+                return
+            fi
+            local cur max
+            cur=$(sysread "$led/brightness")
+            max=$(sysread "$led/max_brightness")
+            echo -e "  LED path : $led"
+            echo -e "  Level    : ${BLD}${cur}${RST} / ${max}"
+            [[ -f "$led/brightness_hw_changed" ]] && \
+                dim "  Hardware key control supported"
+            ;;
+
+        set|level)
+            need_root
+            local val="${1:-}"
+            [[ -n "$val" ]] || die "Usage: huawei keyboard set <level>"
+            is_int "$val" || die "Level must be a non-negative integer."
+            local led
+            led=$(_kb_led)
+            [[ -n "$led" ]] || die "No keyboard backlight LED found."
+            local max
+            max=$(sysread "$led/max_brightness")
+            [[ "$val" -le "$max" ]] || die "Max level is $max."
+            syswrite "$led/brightness" "$val"
+            ok "Keyboard backlight set to $val (max $max)"
+            ;;
+
+        off)
+            need_root
+            local led
+            led=$(_kb_led)
+            [[ -n "$led" ]] || die "No keyboard backlight LED found."
+            syswrite "$led/brightness" 0
+            ok "Keyboard backlight off"
+            ;;
+
+        max)
+            need_root
+            local led
+            led=$(_kb_led)
+            [[ -n "$led" ]] || die "No keyboard backlight LED found."
+            local max
+            max=$(sysread "$led/max_brightness")
+            syswrite "$led/brightness" "$max"
+            ok "Keyboard backlight at maximum ($max)"
+            ;;
+
+        *)
+            err "Unknown keyboard subcommand: $sub"
+            echo "Usage: huawei keyboard {status|set <level>|off|max}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# SLEEP — suspend state management and wake diagnostics
+# =============================================================================
+cmd_sleep() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            hdr "Sleep / Suspend"
+
+            # Current + available mem_sleep states
+            if [[ -f /sys/power/mem_sleep ]]; then
+                local raw
+                raw=$(sysread /sys/power/mem_sleep)
+                local current
+                current=$(echo "$raw" | grep -oP '\[\K[^\]]+' || echo "unknown")
+                local available
+                available="${raw//[\[\]]/}"
+                echo -e "  Active state : ${BLD}${current}${RST}"
+                echo -e "  Available    : $available"
+                echo ""
+                case "$current" in
+                    s2idle)
+                        ok "s2idle (S0ix modern standby) — recommended for Meteor Lake"
+                        ;;
+                    deep)
+                        warn "deep (S3) — works but uses more resume time; s2idle preferred on this CPU"
+                        ;;
+                esac
+            else
+                warn "/sys/power/mem_sleep not found"
+            fi
+
+            # Kernel command line hint
+            echo ""
+            if grep -q "mem_sleep_default" /proc/cmdline 2>/dev/null; then
+                local val
+                val=$(grep -oP 'mem_sleep_default=\K\S+' /proc/cmdline)
+                ok "mem_sleep_default=$val set in kernel cmdline"
+            else
+                dim "  mem_sleep_default not set in kernel cmdline"
+                dim "  To persist: add mem_sleep_default=s2idle to GRUB_CMDLINE_LINUX in /etc/default/grub"
+            fi
+
+            # Last wake source
+            echo ""
+            info "Last suspend/wake events (journalctl):"
+            journalctl -b --no-pager -q \
+                -g "Reached target Sleep|Starting Suspend|Finished.*Resume" \
+                2>/dev/null | tail -6 | sed 's/^/  /' || dim "  (none found this boot)"
+            ;;
+
+        set)
+            need_root
+            local state="${1:-}"
+            [[ -n "$state" ]] || die "Usage: huawei sleep set <s2idle|deep>"
+            [[ -f /sys/power/mem_sleep ]] || die "/sys/power/mem_sleep not available"
+            local available
+            available=$(sysread /sys/power/mem_sleep)
+            echo "$available" | grep -qw "$state" || die "State '$state' not available. Options: $available"
+            syswrite /sys/power/mem_sleep "$state"
+            ok "Sleep state set to: $state  (active until reboot)"
+            warn "To persist: add mem_sleep_default=${state} to GRUB_CMDLINE_LINUX in /etc/default/grub, then: sudo update-grub"
+            ;;
+
+        persist)
+            need_root
+            local state="${1:-s2idle}"
+            local grub_file="/etc/default/grub"
+            [[ -f "$grub_file" ]] || die "GRUB config not found at $grub_file"
+
+            if grep -q "mem_sleep_default=" "$grub_file"; then
+                sed -i "s/mem_sleep_default=[^ \"]*/mem_sleep_default=${state}/" "$grub_file"
+            else
+                sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"mem_sleep_default=${state} /" "$grub_file"
+            fi
+            update-grub 2>/dev/null && ok "GRUB updated — mem_sleep_default=${state} will persist after reboot"
+            ;;
+
+        diagnose)
+            hdr "Sleep Diagnostics"
+
+            info "Wake-up sources:"
+            cat /proc/acpi/wakeup 2>/dev/null | grep "enabled" | sed 's/^/  /' \
+                || dim "  /proc/acpi/wakeup not available"
+
+            echo ""
+            info "Last 10 suspend/resume kernel messages:"
+            journalctl -b --no-pager -q -g "PM:|suspend|resume|wake" -n 20 \
+                2>/dev/null | tail -10 | sed 's/^/  /' || dim "  (none)"
+
+            echo ""
+            info "Last wake reason (dmesg):"
+            dmesg 2>/dev/null | grep -iE "wake|resume|PM: " | tail -8 | sed 's/^/  /' \
+                || dim "  (none)"
+            ;;
+
+        *)
+            err "Unknown sleep subcommand: $sub"
+            echo "Usage: huawei sleep {status|set <s2idle|deep>|persist [state]|diagnose}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# DUAL-BOOT — Windows/Linux coexistence utilities
+# =============================================================================
+cmd_dualboot() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    # Find NTFS partitions
+    _ntfs_parts() {
+        lsblk -rno NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT 2>/dev/null \
+            | awk '$2=="ntfs"{print $1,$3,$4,$5}'
+    }
+
+    case "$sub" in
+        status)
+            hdr "Dual-Boot Status"
+
+            # Windows partitions
+            echo -e "  ${BLD}NTFS partitions:${RST}"
+            local found=false
+            while IFS=' ' read -r dev label size mp; do
+                printf "  /dev/%-12s  %-20s  %-8s  %s\n" \
+                    "$dev" "${label:-(no label)}" "$size" "${mp:-(not mounted)}"
+                found=true
+            done < <(_ntfs_parts)
+            $found || dim "  None found"
+
+            # Hardware clock mode
+            echo ""
+            echo -e "  ${BLD}Hardware clock:${RST}"
+            local rtc_mode
+            rtc_mode=$(timedatectl show --property=LocalRTC --value 2>/dev/null || echo "unknown")
+            if [[ "$rtc_mode" == "no" ]]; then
+                ok "UTC (correct for Linux/Windows dual-boot)"
+            elif [[ "$rtc_mode" == "yes" ]]; then
+                warn "Local time — clocks will drift between OS reboots"
+                dim "  Fix with: huawei dual-boot fix-clock"
+            else
+                dim "  Unknown RTC mode: $rtc_mode"
+            fi
+
+            # Fast startup check
+            echo ""
+            echo -e "  ${BLD}Windows Fast Startup:${RST}"
+            local hiberfil_found=false
+            while IFS=' ' read -r dev label size mp; do
+                local mnt="/mnt/_huawei_dualboot_check_$$"
+                mkdir -p "$mnt"
+                if mount -t ntfs3 -o ro "/dev/${dev}" "$mnt" 2>/dev/null \
+                   || mount -t ntfs -o ro "/dev/${dev}" "$mnt" 2>/dev/null; then
+                    if [[ -f "$mnt/hiberfil.sys" ]]; then
+                        local hib_size
+                        hib_size=$(du -sh "$mnt/hiberfil.sys" 2>/dev/null | cut -f1)
+                        warn "hiberfil.sys found on /dev/${dev} (${hib_size}) — Fast Startup is ON"
+                        warn "Mounting this partition read-write risks filesystem corruption"
+                        dim "  Fix in Windows: Control Panel → Power → Turn on fast startup → uncheck"
+                        hiberfil_found=true
+                    fi
+                    umount "$mnt" 2>/dev/null || true
+                fi
+                rmdir "$mnt" 2>/dev/null || true
+            done < <(_ntfs_parts)
+            $hiberfil_found || ok "No hiberfil.sys found (Fast Startup appears off, or partition not mounted)"
+            ;;
+
+        fix-clock)
+            need_root
+            timedatectl set-local-rtc 0 --adjust-system-clock
+            ok "RTC set to UTC — Linux clock corrected"
+            info "Windows fix: run in PowerShell as admin:"
+            echo -e "  ${DIM}reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f${RST}"
+            ;;
+
+        mount)
+            need_root
+            local dev="${1:-}"
+            if [[ -z "$dev" ]]; then
+                echo "Available NTFS partitions:"
+                _ntfs_parts | awk '{printf "  /dev/%s  %s  %s\n",$1,$2,$3}'
+                echo ""
+                die "Usage: huawei dual-boot mount <device>  e.g. sda3 or nvme0n1p3"
+            fi
+            [[ "$dev" != /dev/* ]] && dev="/dev/$dev"
+            [[ -b "$dev" ]] || die "Device not found: $dev"
+
+            local label
+            label=$(lsblk -no LABEL "$dev" 2>/dev/null | tr -d ' ')
+            local mnt="/mnt/${label:-windows}"
+            mkdir -p "$mnt"
+
+            # Check for hiberfil.sys first (safe mount)
+            local tmp_mnt="/mnt/_huawei_hibcheck_$$"
+            mkdir -p "$tmp_mnt"
+            if mount -t ntfs3 -o ro "$dev" "$tmp_mnt" 2>/dev/null \
+               || mount -t ntfs  -o ro "$dev" "$tmp_mnt" 2>/dev/null; then
+                if [[ -f "$tmp_mnt/hiberfil.sys" ]]; then
+                    umount "$tmp_mnt"; rmdir "$tmp_mnt"
+                    warn "hiberfil.sys present — Windows Fast Startup is on."
+                    warn "Mounting read-write may corrupt the filesystem."
+                    read -rp "Mount read-only instead? [Y/n]: " ans
+                    if [[ "${ans,,}" != "n" ]]; then
+                        mount -t ntfs3 -o ro "$dev" "$mnt" 2>/dev/null \
+                            || mount -t ntfs -o ro "$dev" "$mnt" \
+                            || die "Mount failed"
+                        ok "Mounted read-only at $mnt"
+                        return
+                    fi
+                fi
+                umount "$tmp_mnt" 2>/dev/null || true
+            fi
+            rmdir "$tmp_mnt" 2>/dev/null || true
+
+            mount -t ntfs3 "$dev" "$mnt" 2>/dev/null \
+                || mount -t ntfs-3g "$dev" "$mnt" 2>/dev/null \
+                || mount -t ntfs "$dev" "$mnt" \
+                || die "Mount failed — is ntfs3 or ntfs-3g available?"
+            ok "Mounted $dev at $mnt"
+            ;;
+
+        umount|unmount)
+            need_root
+            local target="${1:-}"
+            [[ -n "$target" ]] || die "Usage: huawei dual-boot umount <mountpoint|device>"
+            umount "$target" && ok "Unmounted $target"
+            ;;
+
+        *)
+            err "Unknown dual-boot subcommand: $sub"
+            echo "Usage: huawei dual-boot {status|fix-clock|mount <dev>|umount <target>}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
 # HELP
 # =============================================================================
 cmd_help() {
@@ -1056,6 +1611,21 @@ cmd_help() {
     echo -e "    ${CYN}touchpad${RST} status                Touchpad detection and quirks"
     echo -e "    ${CYN}touchpad${RST} rebind                Force i2c rebind (fixes freezes)"
     echo -e "    ${CYN}display${RST} brightness [0-100]     Get/set screen brightness"
+    echo -e "    ${CYN}display${RST} scale [1-2]            Get/set HiDPI scaling factor"
+    echo -e "    ${CYN}display${RST} night-light [on|off|temp K]  Night light control"
+    echo -e "    ${CYN}display${RST} color-profile [file.icc]     Import ICC color profile"
+    echo -e "    ${CYN}keyboard${RST} status               Keyboard backlight level"
+    echo -e "    ${CYN}keyboard${RST} set <level>           Set backlight level"
+    echo -e "    ${CYN}keyboard${RST} off|max               Backlight off or maximum"
+    echo -e "    ${CYN}thermal${RST} status                 CPU temps and fan speeds"
+    echo -e "    ${CYN}thermal${RST} watch [secs]           Live thermal monitor"
+    echo -e "    ${CYN}sleep${RST}   status                 Current suspend state (s2idle/deep)"
+    echo -e "    ${CYN}sleep${RST}   set <s2idle|deep>      Set sleep state"
+    echo -e "    ${CYN}sleep${RST}   persist [state]        Persist via GRUB cmdline"
+    echo -e "    ${CYN}sleep${RST}   diagnose               Wake/suspend log analysis"
+    echo -e "    ${CYN}dual-boot${RST} status               Windows partitions + clock check"
+    echo -e "    ${CYN}dual-boot${RST} fix-clock            Set RTC to UTC"
+    echo -e "    ${CYN}dual-boot${RST} mount <dev>          Mount Windows partition safely"
     echo -e "    ${CYN}audio${RST}   status                 PipeWire status"
     echo -e "    ${CYN}audio${RST}   volume [0-100|mute]    Get/set volume"
     echo -e "    ${CYN}audio${RST}   restart                Restart PipeWire stack"
@@ -1094,6 +1664,10 @@ main() {
         camera|cam)             cmd_camera "$@" ;;
         info|i)                 cmd_info "$@" ;;
         updates|up|u)           cmd_updates "$@" ;;
+        thermal|temp)           cmd_thermal "$@" ;;
+        keyboard|kbd|keys)      cmd_keyboard "$@" ;;
+        sleep|suspend)          cmd_sleep "$@" ;;
+        dual-boot|dualboot|db)  cmd_dualboot "$@" ;;
         help|-h|--help)         cmd_help ;;
         *)
             err "Unknown command: $cmd"
