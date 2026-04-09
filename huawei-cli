@@ -142,7 +142,7 @@ cmd_status() {
         kb_val=$(sysread "$kb_path")
         _row "Keyboard backlight" "OK" "Level: $kb_val"
     else
-        _row "Keyboard backlight" "UNKNOWN" "No LED sysfs entry found"
+        _row "Keyboard backlight" "WARN" "Not present on this model"
     fi
 
     hdr "Network"
@@ -1295,8 +1295,15 @@ cmd_keyboard() {
             local led
             led=$(_kb_led)
             if [[ -z "$led" ]]; then
-                warn "No keyboard backlight LED found in /sys/class/leds/"
-                dim "  Huawei WMI module may need loading: sudo modprobe huawei_wmi"
+                # Try loading huawei_wmi and re-check before giving up
+                if ! lsmod | grep -q huawei_wmi; then
+                    modprobe huawei_wmi 2>/dev/null || true
+                    led=$(_kb_led)
+                fi
+                if [[ -z "$led" ]]; then
+                    info "No keyboard backlight LED found (huawei_wmi loaded, no LED exposed)"
+                    dim "  This model does not have a backlit keyboard"
+                fi
                 return
             fi
             local cur max
