@@ -25,6 +25,9 @@ camera/
   install.sh             Registers both DKMS packages, handles MOK signing
   gc2607/                Vendored GC2607 V4L2 sensor driver + dkms.conf
   ipu-bridge-gc2607/     Rebuilds ipu_bridge with a GCTI2607 entry
+fingerprint/
+  install.sh             Fetches/builds gxfp5130-linux kernel module + userspace tools
+  uninstall.sh           Removes gxfp stack
 ```
 
 `gc2607-v4l2-driver/` may exist locally — an upstream working clone

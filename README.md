@@ -16,7 +16,7 @@ Setup scripts and management tools for getting Huawei MateBook hardware working 
 | Battery | ✅ Working | Works out of the box |
 | GPU | ✅ Working | Intel Arc (Meteor Lake) via i915/Xe |
 | Webcam | ✅ Working | GalaxyCore GC2607 — needs the out-of-tree driver in [`camera/`](#camera) |
-| Fingerprint | ❌ Broken | Goodix sensor — no Linux driver for this model |
+| Fingerprint | 🧪 Partial | Goodix GXFP5130 — experimental driver in [`fingerprint/`](#fingerprint); libfprint/PAM setup still manual |
 
 ---
 
@@ -51,6 +51,7 @@ huawei display brightness 60         # set screen brightness
 huawei audio volume 50               # set volume
 huawei wifi toggle                   # toggle WiFi
 huawei camera status                 # camera module/HAL status
+huawei fingerprint status            # Goodix GXFP5130 diagnostics
 huawei updates check                 # check status of known upstream bugs
 huawei updates add <github-url>      # track a custom GitHub issue
 ```
@@ -293,6 +294,39 @@ as shown by `media-ctl` is a V4L2 subdev name, not a device path.
 
 ---
 
+## Fingerprint
+
+The MateBook X Pro 2024 fingerprint sensor is a **Goodix GXFP5130** connected
+over the Embedded Controller's internal SPI bus via an **eSPI mailbox**. It does
+not show up as a normal USB or I²C device, so stock `libfprint` cannot see it.
+
+`fingerprint/install.sh` fetches the upstream `gxfp5130-linux` sources, builds
+the `gxfp` kernel module via DKMS (so it survives kernel upgrades and is signed
+under Secure Boot), and installs the userspace tools:
+
+```bash
+sudo ./fingerprint/install.sh
+sudo huawei fingerprint provision   # generate the TLS PSK
+```
+
+This gets you `/dev/gxfp` and the capture tools. The remaining pieces — a
+patched `libfprint` fork and `fprintd` PAM configuration — are **not automated**
+because a mistake can lock you out of your system. Follow the upstream guide to
+complete the setup:
+
+- https://github.com/Metrohan/gxfp5130-linux
+
+To remove the kernel module and tools:
+
+```bash
+sudo ./fingerprint/uninstall.sh
+```
+
+A kernel patch series for the GXFP5130 is also under review for mainline
+inclusion as of July 2026.
+
+---
+
 ## Quick Start
 
 ```bash
@@ -367,7 +401,7 @@ The Goodix fingerprint sensor on this model is a **GXFP5130** (ACPI HID `GXFP513
 - **[Metrohan/gxfp5130-linux](https://github.com/Metrohan/gxfp5130-linux)** provides an out-of-tree kernel module, a `libfprint` fork, userspace tools, and PAM integration. It is reported working on the MateBook D16 2024 and the patch series explicitly lists the MateBook X Pro 2024.
 - A kernel patch series was submitted in July 2026: **[[PATCH 0/4] drivers/misc: add Goodix GXFP5130 eSPI fingerprint sensor driver](https://lore.kernel.org/linux-kernel/20260718080917.21893-1-metehangnen@gmail.com/)**.
 
-It is **not yet mainlined** and not packaged for Ubuntu, so it is still experimental and not integrated into this toolkit.
+It is **not yet mainlined** and not packaged for Ubuntu, but this repo can install the experimental kernel module and userspace tools via `fingerprint/install.sh`. The `libfprint` fork and PAM configuration are **not automated** because a misconfiguration can lock you out of your system.
 
 ---
 

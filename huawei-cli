@@ -239,7 +239,13 @@ cmd_status() {
         _row "Camera streaming" "UNKNOWN" "Run: huawei camera test"
     fi
 
-    _row "Fingerprint reader" "FAIL" "No Linux driver (Goodix — unsupported)"
+    if [[ -c /dev/gxfp ]]; then
+        _row "Fingerprint reader" "OK" "gxfp driver loaded (/dev/gxfp)"
+    elif [[ -e /sys/bus/acpi/devices/GXFP5130:00 ]]; then
+        _row "Fingerprint reader" "WARN" "GXFP5130 present; driver not installed"
+    else
+        _row "Fingerprint reader" "FAIL" "No Goodix GXFP5130 ACPI node found"
+    fi
 
     echo ""
 }
@@ -1241,6 +1247,76 @@ cmd_camera() {
 }
 
 # =============================================================================
+# FINGERPRINT — Goodix GXFP5130 (experimental)
+# =============================================================================
+cmd_fingerprint() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        status)
+            _check_fingerprint
+            ;;
+
+        install)
+            need_root
+            local script_path script_dir
+            script_path=$(readlink -f "${BASH_SOURCE[0]:-$0}")
+            script_dir=$(dirname "$script_path")
+
+            if [[ -x "${script_dir}/fingerprint/install.sh" ]]; then
+                exec "${script_dir}/fingerprint/install.sh"
+            elif [[ -x "./fingerprint/install.sh" ]]; then
+                exec "./fingerprint/install.sh"
+            else
+                die "fingerprint/install.sh not found — run from the repo: sudo ./fingerprint/install.sh"
+            fi
+            ;;
+
+        uninstall|remove)
+            need_root
+            local script_path script_dir
+            script_path=$(readlink -f "${BASH_SOURCE[0]:-$0}")
+            script_dir=$(dirname "$script_path")
+
+            if [[ -x "${script_dir}/fingerprint/uninstall.sh" ]]; then
+                exec "${script_dir}/fingerprint/uninstall.sh"
+            elif [[ -x "./fingerprint/uninstall.sh" ]]; then
+                exec "./fingerprint/uninstall.sh"
+            else
+                die "fingerprint/uninstall.sh not found — run from the repo: sudo ./fingerprint/uninstall.sh"
+            fi
+            ;;
+
+        provision)
+            need_root
+            local psk_dir=/var/lib/fprintd/gxfp
+            local psk="${psk_dir}/psk_raw32.bin"
+
+            install -d -m 0700 "$psk_dir"
+            if [[ -f "$psk" ]]; then
+                ok "PSK already exists at ${psk}"
+            else
+                if ! command -v gxfp_psk_tool &>/dev/null; then
+                    die "gxfp_psk_tool not found — run first: sudo huawei fingerprint install"
+                fi
+                info "Provisioning TLS PSK for GXFP5130…"
+                gxfp_psk_tool generate > "$psk"
+                chmod 0600 "$psk"
+                ok "PSK written to ${psk}"
+            fi
+            dim "  Test capture: sudo gxfp_capture --psk-raw32 ${psk}"
+            ;;
+
+        *)
+            err "Unknown fingerprint subcommand: $sub"
+            echo "Usage: huawei fingerprint {status|install|uninstall|provision}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
 # UPDATES — track known upstream issues and local fix status
 # =============================================================================
 
@@ -1358,50 +1434,45 @@ _show_gh_item() {
 
 # --- Local checks ------------------------------------------------------------
 _check_fingerprint() {
-    echo -e "\n  ${BLD}Fingerprint: Goodix sensor Linux driver support${RST}"
+    echo -e "\n  ${BLD}Fingerprint: Goodix GXFP5130 Linux driver support${RST}"
 
-    # Find fingerprint USB device (Goodix VID = 27c6, common MateBook PIDs)
-    local fp_usb
-    fp_usb=$(lsusb 2>/dev/null | grep -i "27c6" || true)
-
-    if [[ -z "$fp_usb" ]]; then
-        dim "  No Goodix USB fingerprint device found on USB bus"
+    local acpi_node="/sys/bus/acpi/devices/GXFP5130:00"
+    if [[ ! -e "$acpi_node" ]]; then
+        warn "  No GXFP5130:00 ACPI node found"
+        dim  "  This laptop may not have the Goodix GXFP5130 sensor."
         return
     fi
+    ok "  GXFP5130:00 ACPI node present"
 
-    echo -e "  Device  : $fp_usb"
+    if mod_loaded gxfp; then
+        ok "  gxfp kernel module loaded"
+    else
+        warn "  gxfp kernel module not loaded"
+        dim  "  Run: sudo ./fingerprint/install.sh && sudo modprobe gxfp"
+    fi
 
-    # Extract VID:PID for libfprint check
-    local vidpid
-    vidpid=$(echo "$fp_usb" | grep -oP '27c6:[0-9a-fA-F]{4}' | head -1 || true)
+    if [[ -c /dev/gxfp ]]; then
+        ok "  /dev/gxfp exists"
+    else
+        warn "  /dev/gxfp not present (module not loaded or probe failed)"
+    fi
 
-    # Check if fprintd sees any enrolled/available devices
     if command -v fprintd-list &>/dev/null; then
         local fp_out
         fp_out=$(fprintd-list "$USER" 2>&1 || true)
         if echo "$fp_out" | grep -qi "no devices"; then
-            echo -e "  Status  : ${RED}${BLD}● not supported${RST}  (fprintd: no devices)"
-        elif echo "$fp_out" | grep -qi "error\|no enrolled"; then
-            echo -e "  Status  : ${YLW}${BLD}! driver present but no enrolled fingers${RST}"
+            warn "  fprintd reports no devices — libfprint fork not installed yet"
+        elif echo "$fp_out" | grep -qi "error"; then
+            warn "  fprintd error: check fprintd-list output"
         else
-            echo -e "  Status  : ${GRN}${BLD}✓ may be working — check fprintd-list${RST}"
+            ok  "  fprintd sees a fingerprint device"
         fi
     else
-        echo -e "  Status  : ${YLW}! fprintd not installed — cannot check${RST}"
+        dim  "  fprintd not installed — cannot check userspace integration"
     fi
 
-    # Check libfprint supported device list
-    local fp_lib
-    fp_lib=$(find /usr/lib -name "libfprint*.so*" 2>/dev/null | head -1)
-    if [[ -n "$vidpid" && -n "$fp_lib" ]]; then
-        if strings "$fp_lib" 2>/dev/null | grep -i "${vidpid,,}" >/dev/null; then
-            ok "  $vidpid found in libfprint device strings"
-        else
-            warn "  $vidpid not found in libfprint — driver likely missing"
-        fi
-    fi
-
-    dim "  libfprint issues: https://gitlab.freedesktop.org/libfprint/libfprint/-/issues"
+    dim "  Upstream driver: https://github.com/Metrohan/gxfp5130-linux"
+    dim "  Kernel patch series: https://lore.kernel.org/linux-kernel/20260718080917.21893-1-metehangnen@gmail.com/"
 }
 
 # --- Kernel version check ----------------------------------------------------
@@ -2133,6 +2204,10 @@ cmd_help() {
     echo -e "    ${CYN}camera${RST}  sign                   Sign gc2607.ko for Secure Boot (MOK)"
     echo -e "    ${CYN}camera${RST}  fix                    Step-by-step setup guide (VGHH-XX)"
     echo -e "    ${CYN}camera${RST}  dmesg                  Camera kernel log messages"
+    echo -e "    ${CYN}fingerprint${RST} status             Goodix GXFP5130 diagnostics"
+    echo -e "    ${CYN}fingerprint${RST} install            Install gxfp DKMS + userspace tools"
+    echo -e "    ${CYN}fingerprint${RST} uninstall          Remove gxfp stack"
+    echo -e "    ${CYN}fingerprint${RST} provision          Generate TLS PSK for the sensor"
     echo -e "    ${CYN}info${RST}                           System + module info"
     echo -e "    ${CYN}updates${RST} check                  Check status of known upstream issues"
     echo -e "    ${CYN}updates${RST} check --no-cache        Force fresh fetch"
@@ -2161,6 +2236,7 @@ main() {
         wifi|wlan|w)            cmd_wifi "$@" ;;
         bluetooth|bt)           cmd_bluetooth "$@" ;;
         camera|cam)             cmd_camera "$@" ;;
+        fingerprint|fp)         cmd_fingerprint "$@" ;;
         info|i)                 cmd_info "$@" ;;
         updates|up|u)           cmd_updates "$@" ;;
         thermal|temp)           cmd_thermal "$@" ;;
