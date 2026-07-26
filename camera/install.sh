@@ -63,8 +63,13 @@ _priv_pub() { openssl rsa  -in "$1" -pubout            2>/dev/null; }
 _cert_pub() { openssl x509 -in "$1" -inform "$2" -pubkey -noout 2>/dev/null; }
 
 _cert_enrolled() {
-    # mokutil --test-key needs DER and prints "is already enrolled" on success
-    mokutil --test-key "$1" 2>/dev/null | grep "is already enrolled" >/dev/null
+    # mokutil --test-key needs DER. Match on its message, not its exit status:
+    # it also probes the kernel trusted keyring, and when that is unavailable
+    # ("Failed to accesss kernel trusted keyring") it exits 1 even while
+    # correctly reporting the certificate as enrolled.
+    local out
+    out="$(mokutil --test-key "$1" 2>/dev/null || true)"
+    [[ "$out" == *"is already enrolled"* ]]
 }
 
 configure_signing() {
