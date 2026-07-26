@@ -211,8 +211,8 @@ script or path argument — that is arbitrary root execution. This is why the GU
 does not run `camera/install.sh` directly and uses `dkms autoinstall` instead.
 
 Still not covered there, in rough order of value: `dual-boot mount`/`umount`,
-keyboard backlight, fan control (`pwm1`), camera exposure/gain/white-balance
-controls, and the virtual-camera stream toggle.
+keyboard backlight, fan control (`pwm1`), and camera exposure/gain/white-balance
+controls.
 
 ## Conventions
 

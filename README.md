@@ -201,8 +201,10 @@ output looks exactly like a fix that didn't work.
 
 The MateBook X Pro 2024's webcam is a **GalaxyCore GC2607** (ACPI HID `GCTI2607`), not the OmniVision part its ACPI tables also advertise — `OVTI13B1` and `OVTI01AS` are both present but disabled (`status=0`). Two pieces are missing from a stock Ubuntu install:
 
-1. **No sensor driver.** The mainline kernel has no GC2607 V4L2 driver.
+1. **No sensor driver.** The mainline kernel has no GC2607 V4L2 driver. The community solution started with [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver); this repo vendors it in `camera/gc2607/` with small local fixes.
 2. **`ipu_bridge` doesn't know the sensor.** Its sensor table has no `GCTI2607` entry (still true as of upstream v7.0), so it never instantiates the sensor's I2C client and nothing probes.
+
+The camera was already demonstrated working on Arch by the [adubovskoy/gc2607-v4l2-driver](https://github.com/adubovskoy/gc2607-v4l2-driver) fork, which adds DKMS packaging, a C ISP daemon, and a systemd service. This project does **not** reimplement that work; it provides an Ubuntu/Debian-specific DKMS + CLI integration and the GStreamer pipeline behind `huawei camera stream`.
 
 `camera/` supplies both as DKMS packages:
 
@@ -249,19 +251,33 @@ ffmpeg -f rawvideo -pixel_format bayer_grbg10le -s 1920x1080 \
 ### Virtual camera for Meet / Zoom / OBS
 
 The sensor emits raw Bayer, which conferencing apps cannot consume directly.
-`huawei camera stream` demosaics it, applies white balance, and publishes an
-RGB stream to a v4l2loopback device that appears as **GC2607 RGB**:
+`huawei camera stream` demosaics it, applies white balance and a vertical flip,
+and publishes an RGB stream to a v4l2loopback device that appears as **GC2607 RGB**:
 
 ```bash
-sudo apt install gstreamer1.0-plugins-bad frei0r-plugins v4l2loopback-dkms
+sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-good \
+                 frei0r-plugins v4l2loopback-dkms
 huawei camera stream                    # default white balance
 huawei camera stream 1.10 1.00 1.30     # custom R G B gains
 ```
 
-`bayer2rgb` comes from `gstreamer1.0-plugins-bad` and the colour filter from
-`frei0r-plugins`; neither is installed by default. The command checks every
-element it needs up front and names the missing package rather than failing
-with a bare GStreamer error.
+`bayer2rgb` comes from `gstreamer1.0-plugins-bad`, `videoflip` from
+`gstreamer1.0-plugins-good`, and the colour filter from `frei0r-plugins`; none
+are installed by default. The command checks every element it needs up front
+and names the missing package rather than failing with a bare GStreamer error.
+
+The command discovers an available `v4l2loopback` device dynamically, stops any
+`v4l2-relayd` instance that holds the loopback, and reloads the module with
+`exclusive_caps=0` so the device can be both written to and read from at the same
+time. The image is flipped vertically because the sensor is mounted upside-down.
+
+Preview the virtual camera while the stream is running in another terminal:
+
+```bash
+gst-launch-1.0 v4l2src device=/dev/video0 ! videoconvert ! autovideosink
+```
+
+Replace `/dev/video0` with the device printed by `huawei camera stream`.
 
 ### Notes
 
