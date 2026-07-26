@@ -763,19 +763,28 @@ cmd_camera() {
             # ── I2C bridge ────────────────────────────────────────────────
             echo ""
             info "I2C bridge (ipu_bridge):"
-            # Look for the client ipu_bridge instantiates at the sensor's
-            # address (0x37), NOT /sys/bus/i2c/devices/i2c-GCTI2607:00 — that
-            # is the ACPI-enumerated node, which is present even when
-            # ipu_bridge has no GCTI2607 entry and reads as a false positive.
-            local i2c_client="" _c
-            for _c in /sys/bus/i2c/devices/[0-9]*-0037; do
-                if [[ -d "$_c" ]]; then i2c_client="$_c"; break; fi
+            # The sensor's I2C device is ACPI-enumerated, so its existence
+            # proves nothing — it is there even when ipu_bridge has no
+            # GCTI2607 entry, which made the old check a false positive. What
+            # actually separates a working stack from a broken one is that the
+            # device got its regulator suppliers and a bound driver. (The
+            # "5-0037" seen in media-ctl is a V4L2 subdev name, not a sysfs
+            # path, so do not go looking for it under /sys/bus/i2c/devices.)
+            local sensor_dev="" _d
+            for _d in /sys/bus/i2c/devices/*GCTI2607*; do
+                if [[ -d "$_d" ]]; then sensor_dev="$_d"; break; fi
             done
-            if [[ -n "$i2c_client" ]]; then
-                ok  "  GC2607 I2C client created by ipu_bridge ($(basename "$i2c_client"))"
-            elif [[ "$gc_status" == "15" ]]; then
-                err "  GC2607 I2C client NOT created — ipu_bridge lacks a GCTI2607 entry"
-                dim "  Fix: sudo ./camera/install.sh   (installs a patched ipu_bridge via DKMS)"
+            if [[ -z "$sensor_dev" ]]; then
+                [[ "$gc_status" == "15" ]] \
+                    && err "  GC2607 I2C device not enumerated"
+            elif [[ -e "$sensor_dev/waiting_for_supplier" ]]; then
+                err "  GC2607 is waiting for a supplier — ipu_bridge has not wired it up"
+                dim "  Fix: sudo ./camera/install.sh   (patched ipu_bridge via DKMS)"
+            elif [[ -L "$sensor_dev/driver" ]]; then
+                ok  "  GC2607 wired up and bound to $(basename "$(readlink -f "$sensor_dev/driver")")"
+            else
+                warn "  GC2607 enumerated but no driver bound"
+                dim "  Try: sudo huawei camera load"
             fi
 
             # ── Kernel modules ────────────────────────────────────────────

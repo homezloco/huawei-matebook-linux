@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n /home/shane/Development/huawei_laptop_linux/huawei-cli)",
+      "Bash(cargo --version)",
+      "Bash(npm --version)",
+      "Bash(pnpm --version)",
+      "Bash(rustc --version)",
+      "Read(//home/shane/.cargo/bin/**)",
+      "Bash(dpkg -l libwebkit2gtk*)",
+      "Read(//home/shane/Development/**)",
+      "Bash(npm create:*)",
+      "Bash(bash:*)",
+      "Bash(zstd -d -c /lib/modules/6.17.0-20-generic/kernel/drivers/media/pci/intel/ipu-bridge.ko.zst)",
+      "Bash(dkms --version)",
+      "Read(//etc/dkms/**)",
+      "Read(//usr/sbin/**)",
+      "Bash(rm -rf /tmp/claude-1000/-home-shane-Development-huawei-laptop-linux/bdd6e8bb-f692-41d9-96c7-c57d2c45eae1/scratchpad/gc-vend)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-shane-Development-huawei-laptop-linux/bdd6e8bb-f692-41d9-96c7-c57d2c45eae1/scratchpad/gc-vend)",
+      "Bash(cp camera/gc2607/gc2607.c camera/gc2607/Makefile /tmp/claude-1000/-home-shane-Development-huawei-laptop-linux/bdd6e8bb-f692-41d9-96c7-c57d2c45eae1/scratchpad/gc-vend/)",
+      "Bash(make KDIR=/lib/modules/7.0.0-28-generic/build)",
+      "Bash(modinfo gc2607.ko)",
+      "Bash(timeout 45 ./huawei-cli camera status)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
+    ]
+  }
+}
