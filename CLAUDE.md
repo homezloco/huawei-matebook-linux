@@ -184,20 +184,35 @@ GitHub issue tracking that mirrors `huawei updates`).
 
 Current state of the coupling:
 
-- `src/main/shell.ts` defines `huaweiCli()`, which runs `/usr/local/bin/huawei`
-- **Nothing calls it** — it is dead code
-- Its panels reimplement the checks natively, using `existsSync('/sys/module/…')`
+- `src/main/shell.ts` defines `huaweiCli()`, which runs `/usr/local/bin/huawei`.
+  **Nothing calls it.** It is still dead code.
+- MateBook checks live in `src/main/hardware-profiles.ts` under the
+  `huawei-matebook` profile, matched on DMI `sys_vendor`. They read sysfs and
+  `dkms status` directly rather than parsing this tool's output.
 
-So the logic is duplicated across two repos rather than shared. Its native
-approach is sound (sysfs, not parsed CLI output), so do not "fix" it by routing
-it through `huawei-cli` — parsing this tool's human-readable, colourised output
-would be strictly more fragile.
+That split is deliberate and worth preserving:
 
-The part worth integrating is what this repo uniquely owns: **camera stack
-installation and lifecycle** (DKMS registration, MOK signing, kernel-upgrade
-survival). A GUI should surface `dkms status` and offer to run
-`camera/install.sh` through its existing pkexec helper, not reimplement it.
-If that is not going to happen, delete the unused `huaweiCli()` bridge.
+- **Status → read sysfs natively in the GUI.** Do not route it through
+  `huawei-cli`. Its output is colourised and human-formatted, and its wording
+  has already changed more than once — `"GC2607 I2C client created"` became
+  `"GC2607 wired up and bound to gc2607"` in a single session. Anything parsing
+  that would have broken silently.
+- **Actions → shell out.** `camera load`, `camera/install.sh` and similar are
+  non-trivial, already tested here, and should not be reimplemented in
+  TypeScript. This is where a bridge earns its place.
+
+The command centre covers the camera stack's *lifecycle* (DKMS built for the
+running kernel, sensor binding, module signature under Secure Boot) with
+`camera-rebuild` and `camera-load` as privileged fixes. Note its security
+boundary: profiles may reference a privileged operation **by name** but cannot
+define one, because `lcc-helper.js` runs as root via pkexec and its safety
+rests on being a fixed allowlist. Never add a privileged op there that takes a
+script or path argument — that is arbitrary root execution. This is why the GUI
+does not run `camera/install.sh` directly and uses `dkms autoinstall` instead.
+
+Still not covered there, in rough order of value: `dual-boot mount`/`umount`,
+keyboard backlight, fan control (`pwm1`), camera exposure/gain/white-balance
+controls, and the virtual-camera stream toggle.
 
 ## Conventions
 
