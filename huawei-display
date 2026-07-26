@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# =============================================================================
+# huawei-display — Display color profile and brightness management
+# For Huawei MateBook high-DPI displays
+# =============================================================================
+
+set -euo pipefail
+
+# --- Configuration -----------------------------------------------------------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/huawei-display"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+CURRENT_PROFILE_FILE="$CONFIG_DIR/current_profile"
+
+# --- Colours -----------------------------------------------------------------
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+BLU='\033[0;34m'
+CYN='\033[0;36m'
+BLD='\033[1m'
+RST='\033[0m'
+
+# --- Helpers -----------------------------------------------------------------
+info()  { echo -e "${BLU}•${RST} $*"; }
+ok()    { echo -e "${GRN}✓${RST} $*"; }
+warn()  { echo -e "${YLW}!${RST} $*"; }
+err()   { echo -e "${RED}✗${RST} $*" >&2; }
+hdr()   { echo -e "\n${BLD}${CYN}$*${RST}"; }
+die()   { err "$*"; exit 1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "This command requires root. Run with sudo."
+}
+
+init_config() {
+    mkdir -p "$PROFILES_DIR"
+    touch "$CURRENT_PROFILE_FILE"
+}
+
+# --- Display detection -------------------------------------------------------
+_get_display() {
+    # Get primary display name
+    xrandr --listmonitors 2>/dev/null | grep '+' | head -1 | awk '{print $4}' || \
+    xrandr 2>/dev/null | grep " connected " | head -1 | cut -d' ' -f1 || \
+    echo "eDP-1"
+}
+
+_get_backlight() {
+    ls -d /sys/class/backlight/*/brightness 2>/dev/null | head -1 || true
+}
+
+# =============================================================================
+# STATUS — Display information
+# =============================================================================
+cmd_status() {
+    hdr "Display Status"
+    
+    local display
+    display=$(_get_display)
+    echo -e "  Primary display: ${BLD}${display}${RST}"
+    
+    # Display info from xrandr
+    if command -v xrandr &>/dev/null; then
+        local disp_info
+        disp_info=$(xrandr 2>/dev/null | grep "^${display} connected" || true)
+        if [[ -n "$disp_info" ]]; then
+            local resolution
+            resolution=$(echo "$disp_info" | grep -oE '[0-9]+x[0-9]+' | head -1 || true)
+            echo "  Resolution: $resolution"
+            
+            # Check if high DPI
+            if [[ -n "$resolution" ]]; then
+                local width height
+                width=$(echo "$resolution" | cut -d'x' -f1)
+                height=$(echo "$resolution" | cut -d'x' -f2)
+                # Assuming 14" display for MateBook
+                local dpi_approx
+                dpi_approx=$((width * 10 / 14))  # Rough approximation
+                if [[ $dpi_approx -gt 150 ]]; then
+                    ok "  High DPI display detected (~${dpi_approx} DPI)"
+                fi
+            fi
+        fi
+    fi
+    
+    # Brightness
+    local bl_path
+    bl_path=$(_get_backlight)
+    if [[ -n "$bl_path" ]]; then
+        local cur max pct
+        cur=$(cat "$bl_path")
+        max=$(cat "${bl_path%brightness}max_brightness")
+        pct=$(( cur * 100 / max ))
+        echo -e "  Brightness: ${pct}% (${cur}/${max})"
+    fi
+    
+    # Night light / blue light filter status
+    if command -v gsettings &>/dev/null; then
+        local night_light
+        night_light=$(gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled 2>/dev/null || echo "false")
+        if [[ "$night_light" == "true" ]]; then
+            info "  Night Light: Enabled"
+        else
+            dim "  Night Light: Disabled"
+        fi
+    fi
+    
+    # Color profile
+    if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
+        local profile
+        profile=$(cat "$CURRENT_PROFILE_FILE")
+        echo -e "  Color profile: ${BLD}${profile}${RST}"
+    fi
+    
+    echo ""
+}
+
+# =============================================================================
+# BRIGHTNESS — Screen brightness control
+# =============================================================================
+cmd_brightness() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    
+    local bl_path
+    bl_path=$(_get_backlight)
+    [[ -n "$bl_path" ]] || die "No backlight control found"
+    
+    local max
+    max=$(cat "${bl_path%brightness}max_brightness")
+    
+    case "$sub" in
+        status|get)
+            local cur pct
+            cur=$(cat "$bl_path")
+            pct=$(( cur * 100 / max ))
+            echo "${pct}%"
+            ;;
+            
+        set)
+            local val="${1:-}"
+            [[ -n "$val" ]] || die "Usage: huawei-display brightness set <0-100>"
+            
+            # Remove % if present
+            val="${val%\%}"
+            
+            # Validate
+            if ! [[ "$val" =~ ^[0-9]+$ ]] || [[ "$val" -gt 100 ]]; then
+                die "Brightness must be 0-100"
+            fi
+            
+            need_root
+            local raw
+            raw=$(( val * max / 100 ))
+            echo "$raw" > "$bl_path"
+            ok "Brightness set to ${val}%"
+            ;;
+            
+        up|inc|increase)
+            local step="${1:-10}"
+            need_root
+            local cur new
+            cur=$(cat "$bl_path")
+            new=$(( cur + (step * max / 100) ))
+            [[ $new -gt $max ]] && new=$max
+            echo "$new" > "$bl_path"
+            ok "Brightness increased"
+            ;;
+            
+        down|dec|decrease)
+            local step="${1:-10}"
+            need_root
+            local cur new
+            cur=$(cat "$bl_path")
+            new=$(( cur - (step * max / 100) ))
+            [[ $new -lt 0 ]] && new=0
+            echo "$new" > "$bl_path"
+            ok "Brightness decreased"
+            ;;
+            
+        min)
+            need_root
+            echo "0" > "$bl_path"
+            ok "Brightness set to minimum"
+            ;;
+            
+        max)
+            need_root
+            echo "$max" > "$bl_path"
+            ok "Brightness set to maximum"
+            ;;
+            
+        *)
+            err "Unknown brightness subcommand: $sub"
+            echo "Usage: huawei-display brightness {status|set <n>|up [n]|down [n]|min|max}"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# GAMMA — Color temperature / gamma adjustment
+# =============================================================================
+cmd_gamma() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    
+    local display
+    display=$(_get_display)
+    
+    case "$sub" in
+        status)
+            hdr "Current Gamma Settings"
+            if command -v xrandr &>/dev/null; then
+                xrandr --verbose 2>/dev/null | grep -A5 "^${display}" | grep "Gamma" | head -1
+                xrandr --verbose 2>/dev/null | grep -A5 "^${display}" | grep "Brightness" | head -1
+            else
+                warn "xrandr not available"
+            fi
+            ;;
+            
+        set)
+            local gamma="${1:-1.0}"
+            if command -v xrandr &>/dev/null; then
+                xrandr --output "$display" --gamma "$gamma" && \
+                    ok "Gamma set to $gamma"
+            else
+                die "xrandr not available"
+            fi
+            ;;
+            
+        warm)
+            # Warm color temperature (reduce blue)
+            if command -v xrandr &>/dev/null; then
+                xrandr --output "$display" --gamma 1.0:0.9:0.8 && \
+                    ok "Warm color temperature applied"
+            fi
+            ;;
+            
+        cool)
+            # Cool color temperature (increase blue)
+            if command -v xrandr &>/dev/null; then
+                xrandr --output "$display" --gamma 0.9:0.95:1.0 && \
+                    ok "Cool color temperature applied"
+            fi
+            ;;
+            
+        reset)
+            if command -v xrandr &>/dev/null; then
+                xrandr --output "$display" --gamma 1.0:1.0:1.0 --brightness 1.0 && \
+                    ok "Gamma and brightness reset"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# NIGHT — Night light / blue light filter
+# =============================================================================
+cmd_night() {
+    local sub="${1:-status}"
+    
+    case "$sub" in
+        status)
+            if command -v gsettings &>/dev/null; then
+                local enabled temp schedule
+                enabled=$(gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled 2>/dev/null)
+                temp=$(gsettings get org.gnome.settings-daemon.plugins.color night-light-temperature 2>/dev/null)
+                echo "Night Light: $enabled"
+                echo "Temperature: ${temp}K"
+            else
+                warn "gsettings not available (not GNOME desktop?)"
+            fi
+            ;;
+            
+        enable|on)
+            if command -v gsettings &>/dev/null; then
+                gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled true && \
+                    ok "Night Light enabled"
+            fi
+            ;;
+            
+        disable|off)
+            if command -v gsettings &>/dev/null; then
+                gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled false && \
+                    ok "Night Light disabled"
+            fi
+            ;;
+            
+        toggle)
+            if command -v gsettings &>/dev/null; then
+                local current
+                current=$(gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled 2>/dev/null)
+                if [[ "$current" == "true" ]]; then
+                    gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled false
+                    ok "Night Light disabled"
+                else
+                    gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled true
+                    ok "Night Light enabled"
+                fi
+            fi
+            ;;
+            
+        temp|temperature)
+            local temp="${2:-4000}"
+            if command -v gsettings &>/dev/null; then
+                gsettings set org.gnome.settings-daemon.plugins.color night-light-temperature "$temp" && \
+                    ok "Night Light temperature set to ${temp}K"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# DPI — High DPI scaling management
+# =============================================================================
+cmd_dpi() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    
+    case "$sub" in
+        status)
+            hdr "DPI / Scaling Settings"
+            
+            # Get current scaling
+            if command -v gsettings &>/dev/null; then
+                local text_scaling
+                text_scaling=$(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null || echo "1.0")
+                echo "Text scaling: $text_scaling"
+            fi
+            
+            # Check Xft.dpi
+            if command -v xrdb &>/dev/null; then
+                local xft_dpi
+                xft_dpi=$(xrdb -query 2>/dev/null | grep Xft.dpi | awk '{print $2}' || echo "not set")
+                echo "Xft.dpi: $xft_dpi"
+            fi
+            
+            # Display DPI from xrandr
+            if command -v xrandr &>/dev/null; then
+                local display
+                display=$(_get_display)
+                local dpi_info
+                dpi_info=$(xrandr --verbose 2>/dev/null | grep -A20 "^${display}" | grep "Width\|Height\|Dimensions" | head -3 || true)
+                if [[ -n "$dpi_info" ]]; then
+                    echo ""
+                    info "Display dimensions:"
+                    echo "$dpi_info" | sed 's/^/  /'
+                fi
+            fi
+            ;;
+            
+        auto)
+            # Auto-detect and set appropriate scaling for MateBook
+            info "Detecting optimal scaling for MateBook..."
+            
+            local display
+            display=$(_get_display)
+            local resolution
+            resolution=$(xrandr 2>/dev/null | grep "^${display} connected" | grep -oE '[0-9]+x[0-9]+' | head -1 || true)
+            
+            if [[ -n "$resolution" ]]; then
+                local width
+                width=$(echo "$resolution" | cut -d'x' -f1)
+                
+                # MateBook X Pro 2024: 3120x2080 @ 14.2"
+                # Recommended scaling: 200% (2x)
+                if [[ $width -ge 3000 ]]; then
+                    info "High resolution display detected (${resolution})"
+                    info "Recommended scaling: 200%"
+                    
+                    if command -v gsettings &>/dev/null; then
+                        gsettings set org.gnome.desktop.interface text-scaling-factor 1.25
+                        ok "Set text scaling to 1.25 (GNOME)"
+                        warn "For full 200% scaling, use Settings → Display → Scale"
+                    fi
+                elif [[ $width -ge 2560 ]]; then
+                    info "QHD+ display detected (${resolution})"
+                    info "Recommended scaling: 150-175%"
+                fi
+            fi
+            ;;
+            
+        set)
+            local scale="${1:-1.0}"
+            if command -v gsettings &>/dev/null; then
+                gsettings set org.gnome.desktop.interface text-scaling-factor "$scale" && \
+                    ok "Text scaling set to $scale"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# PROFILE — Color profile management
+# =============================================================================
+cmd_profile() {
+    local sub="${1:-list}"
+    shift 2>/dev/null || true
+    
+    case "$sub" in
+        list|ls)
+            hdr "Available Color Profiles"
+            
+            # List built-in profiles
+            echo "  ${BLD}Built-in profiles:${RST}"
+            echo "    srgb       - sRGB standard (web default)"
+            echo "    adobe      - Adobe RGB (photography)"
+            echo "    dcip3      - DCI-P3 (video/DCI)"
+            echo "    rec2020    - Rec. 2020 (HDR video)"
+            echo "    wide       - Wide gamut native"
+            echo "    photo      - Photo editing optimized"
+            echo "    web        - Web design optimized"
+            echo "    video      - Video editing optimized"
+            
+            # List custom profiles
+            if [[ -d "$PROFILES_DIR" ]]; then
+                local custom
+                custom=$(ls "$PROFILES_DIR"/*.icc "$PROFILES_DIR"/*.icm 2>/dev/null || true)
+                if [[ -n "$custom" ]]; then
+                    echo ""
+                    echo "  ${BLD}Custom profiles:${RST}"
+                    echo "$custom" | while read -r f; do
+                        echo "    $(basename "$f")"
+                    done
+                fi
+            fi
+            
+            # Current profile
+            if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
+                echo ""
+                ok "Current: $(cat "$CURRENT_PROFILE_FILE")"
+            fi
+            ;;
+            
+        apply|set)
+            local profile="${1:-}"
+            [[ -n "$profile" ]] || die "Usage: huawei-display profile apply <profile>"
+            
+            case "$profile" in
+                srgb)
+                    # sRGB profile using xcalib or xrandr
+                    if command -v xcalib &>/dev/null; then
+                        xcalib -c  # Clear current
+                        ok "Applied sRGB profile"
+                    else
+                        warn "xcalib not installed, using xrandr gamma"
+                        xrandr --output "$(_get_display)" --gamma 1.0:1.0:1.0
+                    fi
+                    ;;
+                    
+                adobe)
+                    info "Adobe RGB requires ICC profile"
+                    warn "Install Adobe RGB ICC profile and use: xcalib <profile.icc>"
+                    ;;
+                    
+                photo)
+                    # Photo editing: slightly warmer, higher contrast
+                    xrandr --output "$(_get_display)" --gamma 1.0:0.98:0.95 --brightness 1.05
+                    ok "Applied photo editing profile"
+                    ;;
+                    
+                web)
+                    # Web design: accurate sRGB
+                    xrandr --output "$(_get_display)" --gamma 1.0:1.0:1.0 --brightness 1.0
+                    ok "Applied web design profile"
+                    ;;
+                    
+                video)
+                    # Video editing: DCI-P3 approximation
+                    xrandr --output "$(_get_display)" --gamma 1.05:1.0:0.95 --brightness 1.1
+                    ok "Applied video editing profile"
+                    ;;
+                    
+                *)
+                    # Try to load custom ICC profile
+                    local icc_file="$PROFILES_DIR/${profile}.icc"
+                    local icm_file="$PROFILES_DIR/${profile}.icm"
+                    
+                    if [[ -f "$icc_file" ]]; then
+                        if command -v xcalib &>/dev/null; then
+                            xcalib "$icc_file" && ok "Applied ICC profile: $profile"
+                        else
+                            die "xcalib not installed (sudo apt install xcalib)"
+                        fi
+                    elif [[ -f "$icm_file" ]]; then
+                        if command -v xcalib &>/dev/null; then
+                            xcalib "$icm_file" && ok "Applied ICM profile: $profile"
+                        fi
+                    else
+                        die "Profile not found: $profile"
+                    fi
+                    ;;
+            esac
+            
+            # Save current profile
+            echo "$profile" > "$CURRENT_PROFILE_FILE"
+            ;;
+            
+        save)
+            local name="${1:-custom}"
+            if command -v xcalib &>/dev/null; then
+                xcalib -p 1 > "$PROFILES_DIR/${name}.icc" && \
+                    ok "Saved current profile as: $name"
+            else
+                warn "Cannot save profile - xcalib not installed"
+            fi
+            ;;
+            
+        import)
+            local file="${1:-}"
+            [[ -f "$file" ]] || die "File not found: $file"
+            cp "$file" "$PROFILES_DIR/"
+            ok "Imported: $(basename "$file")"
+            ;;
+            
+        reset)
+            if command -v xcalib &>/dev/null; then
+                xcalib -c && ok "Color profile reset"
+            fi
+            xrandr --output "$(_get_display)" --gamma 1.0:1.0:1.0 --brightness 1.0
+            rm -f "$CURRENT_PROFILE_FILE"
+            ;;
+    esac
+}
+
+# =============================================================================
+# CALIBRATE — Quick display calibration
+# =============================================================================
+cmd_calibrate() {
+    hdr "Quick Display Calibration"
+    
+    info "This will help calibrate your display brightness and contrast"
+    echo ""
+    
+    # Brightness test
+    info "Step 1: Brightness calibration"
+    echo "  Adjust brightness so you can see all shades below:"
+    echo ""
+    echo "  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+    echo "  ████████████████████████████████████████████████  (should be visible)"
+    echo "  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    echo ""
+    read -rp "Press Enter when ready..."
+    
+    # Contrast test
+    info "Step 2: Contrast calibration"
+    echo "  You should be able to distinguish all blocks:"
+    echo ""
+    for i in {0..15}; do
+        local gray=$(( i * 17 ))
+        printf "\e[48;2;%d;%d;%dm  \e[0m" "$gray" "$gray" "$gray"
+    done
+    echo ""
+    echo ""
+    
+    # Recommend profile based on use case
+    info "Step 3: Select your use case"
+    echo "  1) Web browsing / General use"
+    echo "  2) Photo editing"
+    echo "  3) Video editing"
+    echo "  4) Programming / Text editing"
+    read -rp "Choice (1-4): " choice
+    
+    case "$choice" in
+        1) cmd_profile apply web ;;
+        2) cmd_profile apply photo ;;
+        3) cmd_profile apply video ;;
+        4) 
+            cmd_gamma reset
+            ok "Applied text editing profile (neutral)"
+            ;;
+    esac
+    
+    ok "Calibration complete!"
+}
+
+# =============================================================================
+# HELP
+# =============================================================================
+cmd_help() {
+    cat << 'EOF'
+
+huawei-display — Display color profile and brightness management
+Optimized for Huawei MateBook high-DPI displays
+
+Usage: huawei-display <command> [subcommand] [args]
+
+Brightness Control:
+  brightness status              Show current brightness
+  brightness set <0-100>         Set brightness percentage
+  brightness up [step]           Increase brightness (default 10%)
+  brightness down [step]         Decrease brightness (default 10%)
+  brightness min                 Set minimum brightness
+  brightness max                 Set maximum brightness
+
+Color Temperature:
+  gamma status                   Show current gamma
+  gamma set <r:g:b>              Set gamma (e.g., 1.0:0.9:0.8)
+  gamma warm                     Warm color temperature
+  gamma cool                     Cool color temperature
+  gamma reset                    Reset to default
+
+Night Light (Blue Light Filter):
+  night status                   Show night light status
+  night enable                   Enable night light
+  night disable                  Disable night light
+  night toggle                   Toggle night light
+  night temp <kelvin>            Set color temperature (e.g., 4000)
+
+High DPI Scaling:
+  dpi status                     Show current DPI settings
+  dpi auto                       Auto-detect optimal scaling
+  dpi set <factor>               Set text scaling factor
+
+Color Profiles:
+  profile list                   List available profiles
+  profile apply <name>           Apply color profile
+  profile save <name>            Save current settings as profile
+  profile import <file.icc>      Import ICC profile
+  profile reset                  Reset to default
+
+Calibration:
+  calibrate                      Interactive display calibration
+
+Status:
+  status                         Show all display information
+
+Examples:
+  huawei-display brightness set 75
+  huawei-display night enable
+  huawei-display profile apply photo
+  huawei-display dpi auto
+
+EOF
+}
+
+# Helper for dim output
+dim() { echo -e "\033[2m$*\033[0m"; }
+
+# =============================================================================
+# Main dispatcher
+# =============================================================================
+main() {
+    init_config
+    
+    local cmd="${1:-status}"
+    shift 2>/dev/null || true
+    
+    case "$cmd" in
+        status|s)               cmd_status "$@" ;;
+        brightness|bright|bri|b)  cmd_brightness "$@" ;;
+        gamma|g)                cmd_gamma "$@" ;;
+        night|n)                cmd_night "$@" ;;
+        dpi|scale|scaling)      cmd_dpi "$@" ;;
+        profile|prof|p)         cmd_profile "$@" ;;
+        calibrate|cal)          cmd_calibrate "$@" ;;
+        help|-h|--help)         cmd_help ;;
+        *)
+            err "Unknown command: $cmd"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

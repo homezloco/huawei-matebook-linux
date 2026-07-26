@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # huawei-cli — Hardware management utility for Huawei MateBook on Linux
-# Tested on: MateBook X Pro 2024 (VGHH-XX), Ubuntu 24.04, Kernel 6.17
+# Tested on: MateBook X Pro 2024 (VGHH-XX), Ubuntu 24.04, Kernels 6.17 / 7.0
 # Usage: huawei <command> [subcommand] [args]
 # Install: sudo cp huawei-cli /usr/local/bin/huawei && sudo chmod +x /usr/local/bin/huawei
 # =============================================================================
@@ -36,6 +36,23 @@ need_root() {
 
 # Numeric guard: is $1 a non-negative integer?
 is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Is kernel module $1 loaded? Checks /sys/module rather than piping lsmod into
+# `grep -q`: grep -q exits on its first match, which SIGPIPEs lsmod, and under
+# `set -o pipefail` the pipeline then returns 141 even though the module WAS
+# found. That silently inverted several checks below. Accepts either spelling
+# of a module name (ipu-bridge / ipu_bridge).
+mod_loaded() { [[ -d "/sys/module/${1//-/_}" ]]; }
+
+# Is any loaded module's name prefixed by $1? For families like
+# intel_skl_int3472_{discrete,tps68470} where any member implies the driver.
+mod_loaded_prefix() {
+    local pfx="${1//-/_}" m
+    for m in /sys/module/"${pfx}"*; do
+        [[ -d "$m" ]] && return 0
+    done
+    return 1
+}
 
 # Read a sysfs file, return empty string on failure
 sysread() { cat "$1" 2>/dev/null || true; }
@@ -146,17 +163,17 @@ cmd_status() {
     fi
 
     hdr "Network"
-    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: no"; then
+    if rfkill list wifi 2>/dev/null | grep "Soft blocked: no" >/dev/null; then
         local ssid
         ssid=$(iwgetid -r 2>/dev/null || echo "not associated")
         _row "WiFi (Intel CNVi)" "OK" "$ssid"
-    elif rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+    elif rfkill list wifi 2>/dev/null | grep "Soft blocked: yes" >/dev/null; then
         _row "WiFi (Intel CNVi)" "WARN" "Soft-blocked (rfkill)"
     else
         _row "WiFi (Intel CNVi)" "UNKNOWN" "Check rfkill list"
     fi
 
-    if rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: no"; then
+    if rfkill list bluetooth 2>/dev/null | grep "Soft blocked: no" >/dev/null; then
         _row "Bluetooth" "OK" "Enabled"
     else
         _row "Bluetooth" "WARN" "Disabled or blocked"
@@ -172,17 +189,17 @@ cmd_status() {
     fi
 
     hdr "Camera"
-    if lsmod | grep -q "intel_ipu6"; then
+    if mod_loaded intel_ipu6; then
         _row "IPU6 kernel module" "OK" "intel_ipu6 loaded"
     else
-        _row "IPU6 kernel module" "FAIL" "Not loaded"
+        _row "IPU6 kernel module" "FAIL" "Not loaded — run: sudo huawei camera load"
     fi
     if [[ -f /usr/lib/libcamhal/plugins/ipu6epmtl.so ]]; then
         _row "Camera HAL (ipu6epmtl)" "OK" "Plugin installed"
     else
         _row "Camera HAL (ipu6epmtl)" "FAIL" "Not installed — run setup script"
     fi
-    if dmesg 2>/dev/null | grep -q "INT3472.*EBUSY"; then
+    if dmesg 2>/dev/null | grep "INT3472.*EBUSY" >/dev/null; then
         _row "Camera streaming" "FAIL" "INT3472 GPIO conflict (upstream bug)"
     else
         _row "Camera streaming" "UNKNOWN" "Run: huawei camera test"
@@ -652,7 +669,7 @@ cmd_wifi() {
             ;;
         toggle)
             need_root
-            if rfkill list wifi | grep -q "Soft blocked: no"; then
+            if rfkill list wifi | grep "Soft blocked: no" >/dev/null; then
                 rfkill block wifi && ok "WiFi disabled"
             else
                 rfkill unblock wifi && ok "WiFi enabled"
@@ -688,7 +705,7 @@ cmd_bluetooth() {
             ;;
         toggle)
             need_root
-            if rfkill list bluetooth | grep -q "Soft blocked: no"; then
+            if rfkill list bluetooth | grep "Soft blocked: no" >/dev/null; then
                 rfkill block bluetooth && ok "Bluetooth disabled"
             else
                 rfkill unblock bluetooth && ok "Bluetooth enabled"
@@ -712,41 +729,401 @@ cmd_camera() {
     case "$sub" in
         status)
             hdr "Camera"
-            if lsmod | grep -q "intel_ipu6"; then
-                ok "intel_ipu6 module loaded"
+
+            # ── Sensor detection ──────────────────────────────────────────
+            local gc_status ov13_status ir_status
+            gc_status=$(cat /sys/bus/acpi/devices/GCTI2607:00/status 2>/dev/null || echo "absent")
+            ov13_status=$(cat /sys/bus/acpi/devices/OVTI13B1:00/status 2>/dev/null || echo "absent")
+            ir_status=$(cat /sys/bus/acpi/devices/OVTI01AS:00/status 2>/dev/null || echo "absent")
+
+            echo ""
+            info "ACPI sensor nodes:"
+            if [[ "$gc_status" == "15" ]]; then
+                ok   "  GCTI2607:00  GalaxyCore GC2607 main camera — ENABLED (status=15)"
+            elif [[ "$gc_status" == "absent" ]]; then
+                dim  "  GCTI2607:00  GalaxyCore GC2607 — not in ACPI table"
             else
-                err "intel_ipu6 not loaded"
+                warn "  GCTI2607:00  GalaxyCore GC2607 — status=${gc_status} (disabled)"
             fi
-            if [[ -f /usr/lib/libcamhal/plugins/ipu6epmtl.so ]]; then
-                ok "Camera HAL plugin installed"
+            if [[ "$ov13_status" == "15" ]]; then
+                ok   "  OVTI13B1:00  OmniVision OV13B10 main camera — ENABLED (status=15)"
+            elif [[ "$ov13_status" == "absent" ]]; then
+                dim  "  OVTI13B1:00  OmniVision OV13B10 — not in ACPI table"
             else
-                err "Camera HAL plugin missing"
+                dim  "  OVTI13B1:00  OmniVision OV13B10 — status=${ov13_status} (disabled/absent)"
             fi
-            if dmesg 2>/dev/null | grep -q "INT3472.*EBUSY"; then
-                warn "INT3472 GPIO conflict detected in dmesg — streaming blocked (upstream bug)"
-                dim "  Track: https://github.com/intel/ipu6-drivers/issues/399"
+            if [[ "$ir_status" == "15" ]]; then
+                ok   "  OVTI01AS:00  OmniVision OV01A1S IR camera — ENABLED"
+            elif [[ "$ir_status" == "absent" ]]; then
+                dim  "  OVTI01AS:00  OmniVision OV01A1S IR — not in ACPI table"
             else
-                info "No INT3472 error in dmesg (camera may be functional)"
+                dim  "  OVTI01AS:00  OmniVision OV01A1S IR — status=${ir_status}"
             fi
+
+            # ── I2C bridge ────────────────────────────────────────────────
+            echo ""
+            info "I2C bridge (ipu_bridge):"
+            # Look for the client ipu_bridge instantiates at the sensor's
+            # address (0x37), NOT /sys/bus/i2c/devices/i2c-GCTI2607:00 — that
+            # is the ACPI-enumerated node, which is present even when
+            # ipu_bridge has no GCTI2607 entry and reads as a false positive.
+            local i2c_client="" _c
+            for _c in /sys/bus/i2c/devices/[0-9]*-0037; do
+                if [[ -d "$_c" ]]; then i2c_client="$_c"; break; fi
+            done
+            if [[ -n "$i2c_client" ]]; then
+                ok  "  GC2607 I2C client created by ipu_bridge ($(basename "$i2c_client"))"
+            elif [[ "$gc_status" == "15" ]]; then
+                err "  GC2607 I2C client NOT created — ipu_bridge lacks a GCTI2607 entry"
+                dim "  Fix: sudo ./camera/install.sh   (installs a patched ipu_bridge via DKMS)"
+            fi
+
+            # ── Kernel modules ────────────────────────────────────────────
+            echo ""
+            info "Kernel modules:"
+            for mod in intel_ipu6 intel_ipu6_isys intel_ipu6_psys ipu_bridge; do
+                if mod_loaded "$mod"; then
+                    ok  "  ${mod}"
+                else
+                    warn "  ${mod}  (not loaded)"
+                fi
+            done
+            if mod_loaded gc2607; then
+                ok  "  gc2607  (GC2607 V4L2 sensor driver)"
+            else
+                err "  gc2607  NOT loaded — sensor driver missing"
+                dim "  Install: sudo ./camera/install.sh"
+            fi
+
+            # ── PMIC / privacy LED ────────────────────────────────────────
+            echo ""
+            info "PMIC / privacy LED:"
+            if mod_loaded_prefix intel_skl_int3472; then
+                ok  "  INT3472 PMIC driver loaded"
+                local led_path
+                led_path=$(find /sys/devices -path "*/GCTI2607*privacy_led/brightness" 2>/dev/null | head -1)
+                if [[ -n "$led_path" ]]; then
+                    local brightness
+                    brightness=$(cat "$led_path" 2>/dev/null)
+                    ok "  Privacy LED found (brightness=${brightness})"
+                fi
+            else
+                warn "  INT3472 PMIC driver not loaded"
+            fi
+
+            # ── V4L2 devices ──────────────────────────────────────────────
             echo ""
             info "V4L2 devices:"
-            ls /dev/video* 2>/dev/null | sed 's/^/  /' || echo "  None found"
+            local vdevs
+            vdevs=$(ls /dev/video* 2>/dev/null)
+            if [[ -n "$vdevs" ]]; then
+                ok "  ${vdevs//$'\n'/ }"
+            else
+                err "  No /dev/video* devices found"
+            fi
+            if command -v media-ctl &>/dev/null; then
+                local sensor_pad
+                # `|| true`: grep exits 1 when the sensor is absent, and under
+                # pipefail that fails the assignment, which set -e turns into
+                # an early exit — silently truncating the rest of this report.
+                sensor_pad=$(media-ctl -d /dev/media0 -p 2>/dev/null | grep -i "gc2607" | head -1 || true)
+                if [[ -n "$sensor_pad" ]]; then
+                    ok  "  gc2607 sensor pad found in media graph"
+                else
+                    warn "  gc2607 not yet in media graph (driver not bound)"
+                fi
+            fi
+
+            # ── Summary ───────────────────────────────────────────────────
+            echo ""
+            if [[ "$gc_status" == "15" ]] && mod_loaded gc2607; then
+                ok  "Camera driver stack looks ready — try: huawei camera test"
+            elif [[ "$gc_status" == "15" ]]; then
+                warn "GC2607 sensor detected but driver missing."
+                echo ""
+                echo "  Install the camera stack via DKMS so it survives kernel upgrades:"
+                dim "    sudo ./camera/install.sh"
+                echo ""
+                dim "  A hand-built gc2607.ko is tied to the kernel it was compiled"
+                dim "  against and stops loading after the next kernel update."
+            else
+                warn "Camera not yet functional on VGHH-XX."
+                dim  "  See: https://github.com/intel/ipu6-drivers/issues/399"
+            fi
+            ;;
+
+        load)
+            need_root
+            hdr "Camera — load module stack"
+
+            # Helper: is gc2607 visible in the media graph?
+            # Note: no `grep -q` here — see mod_loaded() for why early-exiting
+            # greps break under pipefail.
+            _gc2607_in_graph() {
+                command -v media-ctl &>/dev/null \
+                    && media-ctl -d /dev/media0 -p 2>/dev/null | grep -i "gc2607" >/dev/null
+            }
+
+            # Helper: load one module (tries both dash and underscore names)
+            _load_mod() {
+                local mod="$1"
+                local mod_dash="${mod//_/-}"
+                if mod_loaded "$mod"; then
+                    ok  "  ${mod} already loaded"
+                elif modprobe "$mod_dash" 2>/dev/null || modprobe "$mod" 2>/dev/null; then
+                    ok  "  ${mod} loaded"
+                else
+                    warn "  ${mod} failed to load"
+                fi
+            }
+
+            # Load in strict order: base → PMIC → IPU6 core → bridge → isys
+            info "Loading kernel modules…"
+            for mod in videodev v4l2_async intel_skl_int3472_discrete \
+                       intel_ipu6 ipu_bridge intel_ipu6_isys; do
+                _load_mod "$mod"
+            done
+
+            echo ""
+            info "Loading GC2607 sensor driver…"
+
+            # Resolve the real user's home when running under sudo
+            # ($HOME is /root under sudo, not the invoking user's home)
+            local real_home="${HOME}"
+            if [[ -n "${SUDO_USER:-}" ]]; then
+                real_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+            fi
+
+            # Ordered list of gc2607.ko candidate paths
+            _gc2607_ko_paths() {
+                local kver; kver=$(uname -r)
+                printf '%s\n' \
+                    "/lib/modules/${kver}/updates/gc2607.ko" \
+                    "/lib/modules/${kver}/extra/gc2607.ko" \
+                    "/opt/gc2607/gc2607.ko"
+                find "${real_home}" -maxdepth 6 -name "gc2607.ko" 2>/dev/null | head -5
+            }
+
+            _load_gc2607() {
+                if modprobe gc2607 2>/dev/null; then
+                    ok "  gc2607 loaded via modprobe"; return 0
+                fi
+                local p
+                while IFS= read -r p; do
+                    if [[ -f "$p" ]]; then
+                        if insmod "$p" 2>/dev/null; then
+                            ok "  gc2607 loaded from $p"; return 0
+                        fi
+                    fi
+                done < <(_gc2607_ko_paths)
+                err "  Could not load gc2607 — run: huawei camera fix"
+                dim "  Or install it: sudo ./camera/install.sh"
+                return 1
+            }
+
+            # gc2607 must be active AFTER intel_ipu6_isys so async-subdev completes.
+            # If it was loaded before isys it won't appear in the media graph — reload it.
+            if mod_loaded gc2607; then
+                if _gc2607_in_graph; then
+                    ok "  gc2607 loaded and in media graph"
+                else
+                    warn "  gc2607 loaded but missing from media graph — reloading after intel_ipu6_isys"
+                    rmmod gc2607 2>/dev/null || true
+                    sleep 1
+                    _load_gc2607 || return 1
+                fi
+            else
+                _load_gc2607 || return 1
+            fi
+
+            echo ""
+            info "Enabling media pipeline link…"
+            if media-ctl -d /dev/media0 \
+                    -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null; then
+                ok "  Media link enabled"
+            else
+                warn "  Could not enable media link — check: huawei camera dmesg"
+            fi
+
+            # Verify gc2607 is now in the media graph
+            echo ""
+            if _gc2607_in_graph; then
+                ok "Camera stack ready — run: huawei camera test"
+            else
+                warn "gc2607 still not in media graph after reload"
+                dim  "  Try: huawei camera dmesg"
+                dim  "  Or reload all modules: sudo rmmod intel_ipu6_isys intel_ipu6_psys intel_ipu6 gc2607 && sudo huawei camera load"
+            fi
             ;;
 
         test)
-            info "Testing camera pipeline via GStreamer (Ctrl+C to stop)..."
-            warn "This will fail on VGHH-XX while INT3472 bug is unresolved."
-            sudo -E gst-launch-1.0 icamerasrc ! fakesink 2>&1 | head -20
+            hdr "Camera — pipeline test"
+            info "Setting up V4L2 pipeline for GC2607 (1920x1080)…"
+            if ! command -v media-ctl &>/dev/null; then
+                die "media-ctl not found — install: sudo apt install v4l-utils"
+            fi
+            if ! mod_loaded gc2607; then
+                die "gc2607 driver not loaded — run first: sudo huawei camera load"
+            fi
+            info "Enabling media pipeline link…"
+            media-ctl -d /dev/media0 \
+                -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null \
+                && ok "  Link enabled" || warn "  Link already enabled or failed — continuing"
+            echo ""
+            info "Configuring format on sensor pad…"
+            media-ctl -d /dev/media0 \
+                --set-v4l2 "'gc2607 5-0037':0 [fmt:SGRBG10_1X10/1920x1080 field:none]" \
+                --verbose 2>&1 | grep -E "Setting|error|ok" | sed 's/^/  /'
+            echo ""
+            info "Capturing one frame to /tmp/gc2607_test.raw …"
+            if v4l2-ctl -d /dev/video0 \
+                --set-fmt-video=width=1920,height=1080,pixelformat=BA10 \
+                --stream-mmap --stream-count=1 \
+                --stream-to=/tmp/gc2607_test.raw 2>&1; then
+                ok "Frame captured: /tmp/gc2607_test.raw"
+                dim "  Convert: ffmpeg -f rawvideo -pixel_format bayer_grbg10le -s 1920x1080 -i /tmp/gc2607_test.raw out.png"
+            else
+                err "Capture failed — check: huawei camera dmesg"
+            fi
+            ;;
+
+        stream)
+            hdr "Camera — virtual RGB stream"
+            if ! mod_loaded gc2607; then
+                die "gc2607 not loaded — run first: sudo huawei camera load"
+            fi
+            if ! command -v gst-launch-1.0 &>/dev/null; then
+                die "gst-launch-1.0 not found — install: sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good"
+            fi
+            # Load v4l2loopback for the virtual camera sink
+            if ! mod_loaded v4l2loopback; then
+                if ! modprobe v4l2loopback devices=1 video_nr=10 \
+                        card_label="GC2607 RGB" exclusive_caps=1 2>/dev/null; then
+                    die "v4l2loopback not available — install: sudo apt install v4l2loopback-dkms"
+                fi
+                ok "v4l2loopback virtual camera at /dev/video10"
+            fi
+            local r_gain="${1:-1.034}" g_gain="${2:-1.000}" b_gain="${3:-1.246}"
+            info "Starting GStreamer pipeline with white balance R=${r_gain} G=${g_gain} B=${b_gain}"
+            info "Virtual camera: /dev/video10  (select 'GC2607 RGB' in OBS, Meet, etc.)"
+            dim  "  Ctrl+C to stop"
+            echo ""
+            # frei0r coloradj-rgb uses 0.0–1.0 scale (divide gain by 2.0)
+            local r_f g_f b_f
+            r_f=$(python3 -c "print(${r_gain}/2.0)")
+            g_f=$(python3 -c "print(${g_gain}/2.0)")
+            b_f=$(python3 -c "print(${b_gain}/2.0)")
+            gst-launch-1.0 -v \
+                v4l2src device=/dev/video0 \
+                ! "video/x-raw,format=GRAY16_LE,width=1920,height=1080,framerate=30/1" \
+                ! bayer2rgb \
+                ! frei0r-filter-coloradj-rgb r-gain="${r_f}" g-gain="${g_f}" b-gain="${b_f}" \
+                ! videoconvert \
+                ! "video/x-raw,format=YUY2" \
+                ! v4l2sink device=/dev/video10
             ;;
 
         dmesg)
-            info "Camera-related kernel messages:"
-            dmesg 2>/dev/null | grep -iE "ipu6|INT3472|OV13B10|OV01A1S|icamera" | tail -30 | sed 's/^/  /'
+            hdr "Camera — kernel messages"
+            dmesg 2>/dev/null \
+                | grep -iE "ipu6|INT3472|gc2607|GCTI|OV13B10|OV01A1S|ipu_bridge|icamera" \
+                | tail -40 \
+                | sed 's/^/  /'
+            ;;
+
+        fix)
+            hdr "Camera — guided fix for VGHH-XX"
+            echo ""
+            echo "  Your MateBook X Pro 2024 uses a GalaxyCore GC2607 sensor."
+            echo "  The mainline kernel lacks a V4L2 driver for this sensor."
+            echo "  A community driver exists and has been verified on this hardware."
+            echo ""
+            echo "  Step 1 — Install prerequisites:"
+            dim "    sudo apt install linux-headers-\$(uname -r) v4l-utils gstreamer1.0-tools"
+            dim "    sudo apt install gstreamer1.0-plugins-good frei0r-plugins v4l2loopback-dkms"
+            echo ""
+            echo "  Step 2 — Install the driver stack via DKMS:"
+            dim "    sudo ./camera/install.sh"
+            echo ""
+            dim "    This registers two packages — gc2607 (the sensor driver) and"
+            dim "    ipu-bridge-gc2607 (ipu_bridge with a GCTI2607 entry) — with"
+            dim "    AUTOINSTALL, so both rebuild on every kernel upgrade. Under"
+            dim "    Secure Boot, DKMS signs them with your enrolled MOK key."
+            echo ""
+            echo "  Step 4 — Load all required modules:"
+            dim "    sudo huawei camera load"
+            echo ""
+            echo "  Step 5 — Capture a test frame:"
+            dim "    huawei camera test"
+            echo ""
+            echo "  Step 6 — Start virtual RGB stream (for OBS, Meet, etc.):"
+            dim "    sudo huawei camera stream"
+            echo ""
+            warn "  The GC2607 HAL is not yet supported by ipu6-camera-hal (libcamera)."
+            dim  "  Track: https://github.com/intel/ipu6-camera-hal/issues/165"
+            ;;
+
+        sign)
+            need_root
+            hdr "Camera — Secure Boot module signing"
+            local mok_dir="/var/lib/shim-signed/mok"
+            local mok_key="${mok_dir}/MOK.priv"
+            local mok_cert="${mok_dir}/MOK.pem"
+            local kver; kver=$(uname -r)
+            local ko="/lib/modules/${kver}/updates/gc2607.ko"
+            local sign_tool="/usr/src/linux-headers-${kver}/scripts/sign-file"
+
+            # Check if MOK key pair exists
+            if [[ ! -f "$mok_key" || ! -f "$mok_cert" ]]; then
+                info "No MOK key found — generating one…"
+                mkdir -p "$mok_dir"
+                openssl req -new -x509 -newkey rsa:2048 \
+                    -keyout "$mok_key" -out "$mok_cert" \
+                    -days 36500 -subj "/CN=$(hostname) Module Signing Key/" -nodes \
+                    2>/dev/null || die "Failed to generate MOK key pair"
+                # mokutil requires DER format
+                openssl x509 -in "$mok_cert" -outform DER \
+                    -out "${mok_cert%.pem}.der" 2>/dev/null \
+                    || die "Failed to convert certificate to DER"
+                ok "MOK key pair generated at $mok_dir/"
+            else
+                ok "MOK key pair found at $mok_dir/"
+            fi
+
+            # Check enrolment status
+            local enrolled=false
+            if mokutil --test-key "$mok_cert" 2>/dev/null | grep -i "already enrolled" >/dev/null; then
+                ok "MOK is enrolled in UEFI"
+                enrolled=true
+            else
+                warn "MOK is NOT yet enrolled in UEFI"
+                echo ""
+                echo "  Run: sudo mokutil --import ${mok_cert%.pem}.der"
+                echo "  Then reboot and confirm enrollment in the blue MOK Manager screen."
+                echo "  After reboot, run this command again to sign the module."
+                echo ""
+                if [[ "${1:-}" != "--force" ]]; then
+                    return 0
+                fi
+                warn "  --force passed — signing anyway (will fail to load until enrolled)"
+            fi
+
+            # Sign the module
+            [[ -f "$ko" ]] || die "gc2607.ko not installed — run: cd <driver-dir> && sudo make install"
+            [[ -f "$sign_tool" ]] || die "sign-file not found — install linux-headers-${kver}"
+            "$sign_tool" sha256 "$mok_key" "$mok_cert" "$ko" \
+                && ok "gc2607.ko signed successfully" \
+                || die "Signing failed"
+
+            if $enrolled; then
+                echo ""
+                ok "Module is signed and key is enrolled — you can now run: sudo huawei camera load"
+            fi
             ;;
 
         *)
             err "Unknown camera subcommand: $sub"
-            echo "Usage: huawei camera {status|test|dmesg}"
+            echo "Usage: huawei camera {status|load|test|stream [R G B]|sign|fix|dmesg}"
             exit 1
             ;;
     esac
@@ -768,7 +1145,7 @@ _USER_ISSUES_FILE="$_CONFIG_DIR/tracked-issues"
 #   type package → ref = package name to check for updates
 #   type local   → ref = script function name
 _BUILTIN_ITEMS=(
-    "github:intel/ipu6-drivers/399|Camera: INT3472 GPIO conflict (VGHH-XX webcam blocked)"
+    "github:intel/ipu6-drivers/399|Camera: GC2607 sensor — community driver available (VGHH-XX)"
     "local:_check_fingerprint|Fingerprint: Goodix sensor Linux driver support"
     "kernel:6.12|Kernel: minimum recommended for touchpad regression fix"
     "package:linux-image-generic-hwe-24.04|Kernel: HWE track updates available"
@@ -885,7 +1262,7 @@ _check_fingerprint() {
 
     # Extract VID:PID for libfprint check
     local vidpid
-    vidpid=$(echo "$fp_usb" | grep -oP '27c6:[0-9a-fA-F]{4}' | head -1)
+    vidpid=$(echo "$fp_usb" | grep -oP '27c6:[0-9a-fA-F]{4}' | head -1 || true)
 
     # Check if fprintd sees any enrolled/available devices
     if command -v fprintd-list &>/dev/null; then
@@ -906,7 +1283,7 @@ _check_fingerprint() {
     local fp_lib
     fp_lib=$(find /usr/lib -name "libfprint*.so*" 2>/dev/null | head -1)
     if [[ -n "$vidpid" && -n "$fp_lib" ]]; then
-        if strings "$fp_lib" 2>/dev/null | grep -qi "${vidpid,,}"; then
+        if strings "$fp_lib" 2>/dev/null | grep -i "${vidpid,,}" >/dev/null; then
             ok "  $vidpid found in libfprint device strings"
         else
             warn "  $vidpid not found in libfprint — driver likely missing"
@@ -947,7 +1324,7 @@ _show_package_item() {
     fi
 
     local installed available
-    installed=$(dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}')
+    installed=$(dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}' || true)
     echo -e "  Installed: $installed"
 
     # Check apt cache for newer version (no network hit if cache is stale)
@@ -1091,7 +1468,7 @@ cmd_updates() {
                 status)
                     if [[ -d "$_CACHE_DIR" ]]; then
                         local count
-                        count=$(ls "$_CACHE_DIR"/*.json 2>/dev/null | wc -l)
+                        count=$(ls "$_CACHE_DIR"/*.json 2>/dev/null | wc -l || true)
                         echo -e "  Cache dir  : $_CACHE_DIR"
                         echo -e "  Entries    : $count"
                         echo -e "  TTL        : $(( _CACHE_TTL / 3600 ))h  (override: HUAWEI_CACHE_TTL)"
@@ -1125,7 +1502,7 @@ cmd_info() {
     hdr "Kernel Modules"
     local mods=(intel_ipu6 i2c_hid_acpi xe i915 snd_hda_intel btintel iwlwifi)
     for m in "${mods[@]}"; do
-        if lsmod | grep -q "^${m}"; then
+        if mod_loaded_prefix "$m"; then
             ok "$m"
         else
             dim "  - $m (not loaded)"
@@ -1296,7 +1673,7 @@ cmd_keyboard() {
             led=$(_kb_led)
             if [[ -z "$led" ]]; then
                 # Try loading huawei_wmi and re-check before giving up
-                if ! lsmod | grep -q huawei_wmi; then
+                if ! mod_loaded huawei_wmi; then
                     modprobe huawei_wmi 2>/dev/null || true
                     led=$(_kb_led)
                 fi
@@ -1516,7 +1893,7 @@ cmd_dualboot() {
                    || mount -t ntfs -o ro "/dev/${dev}" "$mnt" 2>/dev/null; then
                     if [[ -f "$mnt/hiberfil.sys" ]]; then
                         local hib_size
-                        hib_size=$(du -sh "$mnt/hiberfil.sys" 2>/dev/null | cut -f1)
+                        hib_size=$(du -sh "$mnt/hiberfil.sys" 2>/dev/null | cut -f1 || true)
                         warn "hiberfil.sys found on /dev/${dev} (${hib_size}) — Fast Startup is ON"
                         warn "Mounting this partition read-write risks filesystem corruption"
                         dim "  Fix in Windows: Control Panel → Power → Turn on fast startup → uncheck"
@@ -1550,7 +1927,7 @@ cmd_dualboot() {
             [[ -b "$dev" ]] || die "Device not found: $dev"
 
             local label
-            label=$(lsblk -no LABEL "$dev" 2>/dev/null | tr -d ' ')
+            label=$(lsblk -no LABEL "$dev" 2>/dev/null | tr -d ' ' || true)
             local mnt="/mnt/${label:-windows}"
             mkdir -p "$mnt"
 
@@ -1638,8 +2015,12 @@ cmd_help() {
     echo -e "    ${CYN}audio${RST}   restart                Restart PipeWire stack"
     echo -e "    ${CYN}wifi${RST}    status/enable/disable/toggle"
     echo -e "    ${CYN}bluetooth${RST} status/enable/disable/toggle"
-    echo -e "    ${CYN}camera${RST}  status                 Camera module/HAL status"
-    echo -e "    ${CYN}camera${RST}  test                   Run GStreamer test pipeline"
+    echo -e "    ${CYN}camera${RST}  status                 GC2607 sensor + driver diagnostics"
+    echo -e "    ${CYN}camera${RST}  load                   Load all camera kernel modules + pipeline"
+    echo -e "    ${CYN}camera${RST}  test                   Capture a test frame via V4L2"
+    echo -e "    ${CYN}camera${RST}  stream [R G B]         Start virtual RGB camera (OBS/Meet)"
+    echo -e "    ${CYN}camera${RST}  sign                   Sign gc2607.ko for Secure Boot (MOK)"
+    echo -e "    ${CYN}camera${RST}  fix                    Step-by-step setup guide (VGHH-XX)"
     echo -e "    ${CYN}camera${RST}  dmesg                  Camera kernel log messages"
     echo -e "    ${CYN}info${RST}                           System + module info"
     echo -e "    ${CYN}updates${RST} check                  Check status of known upstream issues"

@@ -1,6 +1,6 @@
-# Huawei MateBook Linux Setup Script
+# Huawei MateBook Linux Toolkit
 
-A one-shot setup script for getting Huawei MateBook hardware working on Ubuntu 24.04. Tested on the **MateBook X Pro 2024 (VGHH-XX)** running kernel 6.17.
+Setup scripts and management tools for getting Huawei MateBook hardware working on Ubuntu. Tested on the **MateBook X Pro 2024 (VGHH-XX)** running kernels 6.17 and 7.0.
 
 ---
 
@@ -15,7 +15,7 @@ A one-shot setup script for getting Huawei MateBook hardware working on Ubuntu 2
 | Touchscreen | ✅ Working | Works out of the box |
 | Battery | ✅ Working | Works out of the box |
 | GPU | ✅ Working | Intel Arc (Meteor Lake) via i915/Xe |
-| Webcam | ❌ Broken | INT3472 GPIO conflict — upstream kernel bug |
+| Webcam | ✅ Working | GalaxyCore GC2607 — needs the out-of-tree driver in [`camera/`](#camera) |
 | Fingerprint | ❌ Broken | Goodix sensor — no Linux driver for this model |
 
 ---
@@ -23,21 +23,25 @@ A one-shot setup script for getting Huawei MateBook hardware working on Ubuntu 2
 ## Requirements
 
 - **OS:** Ubuntu 24.04 LTS
-- **Kernel:** 6.8 or newer (6.17 tested)
+- **Kernel:** 6.8 or newer (6.17 and 7.0 tested)
 - **Hardware:** Huawei MateBook X Pro 2024 (VGHH-XX) — other MateBook models may work with adjustments
 
 ---
 
-## CLI Utility
+## CLI Utilities
 
-`huawei-cli` is a day-to-day hardware management tool — separate from the one-shot setup script.
+We provide several CLI tools for day-to-day management of your MateBook on Linux.
+
+### `huawei` — Hardware Management
+
+The main hardware management tool for status, battery, power, and connectivity.
 
 ```bash
 # Install
 sudo cp huawei-cli /usr/local/bin/huawei
 sudo chmod +x /usr/local/bin/huawei
 
-# Examples
+# Core commands
 huawei status                        # full hardware report
 huawei battery threshold 80          # stop charging at 80%
 huawei battery threshold-persist 80  # persist across reboots
@@ -51,26 +55,195 @@ huawei updates check                 # check status of known upstream bugs
 huawei updates add <github-url>      # track a custom GitHub issue
 ```
 
-Commands that write to hardware require `sudo`. Run `huawei help` for the full reference.
+### `huawei-thermal` — Thermal & Fan Control
 
-`huawei updates check` polls GitHub for known open issues (webcam INT3472 fix, etc.), checks for kernel/package updates, and caches results for 6 hours. Use `--no-cache` to force a fresh fetch.
+Manage temperatures, fan speeds, and CPU throttling.
+
+```bash
+# Install
+sudo cp huawei-thermal.sh /usr/local/bin/huawei-thermal
+sudo chmod +x /usr/local/bin/huawei-thermal
+
+# Commands
+huawei-thermal status               # show all temperatures
+huawei-thermal monitor              # live temperature monitor
+huawei-thermal profile performance  # set high-performance mode
+huawei-thermal profile quiet        # set quiet/efficient mode
+huawei-thermal throttle             # check thermal throttling status
+sudo huawei-thermal fan set 128     # manual fan control (if supported)
+sudo huawei-thermal undervolt apply -50  # CPU undervolting (requires intel-undervolt)
+```
+
+### `huawei-connect` — Phone Integration (Huawei Share Alternative)
+
+Replace Huawei Share / Multi-Screen Collaboration with Linux-native solutions.
+
+```bash
+# Install
+sudo cp huawei-connect /usr/local/bin/huawei-connect
+sudo chmod +x /usr/local/bin/huawei-connect
+
+# Dependencies: sudo apt install kdeconnect scrcpy adb qrencode
+
+# Pairing & file transfer
+huawei-connect pair                 # pair with phone (shows QR code)
+huawei-connect share <file>         # send file to phone
+huawei-connect receive              # monitor for incoming files
+huawei-connect web                  # web interface for file sharing
+
+# Screen mirroring (requires USB debugging enabled on phone)
+huawei-connect screen mirror        # mirror phone screen
+huawei-connect screen record        # record phone screen
+huawei-connect screen audio         # forward phone audio
+
+# Clipboard & notifications
+huawei-connect clipboard send       # send clipboard to phone
+huawei-connect clipboard monitor    # auto-sync clipboard
+huawei-connect notifications enable # sync notifications
+
+# Other features
+huawei-connect find                 # ring phone to locate it
+huawei-connect sms                  # send SMS from computer
+```
+
+### `huawei-display` — Display & Color Management
+
+Optimize the MateBook's high-DPI display for different use cases.
+
+```bash
+# Install
+sudo cp huawei-display /usr/local/bin/huawei-display
+sudo chmod +x /usr/local/bin/huawei-display
+
+# Brightness
+huawei-display brightness set 75
+huawei-display brightness up 10
+huawei-display brightness down
+
+# Color temperature
+huawei-display night enable         # blue light filter
+huawei-display night temp 4000      # warmer color temp
+huawei-display gamma warm           # manual warm adjustment
+huawei-display gamma cool           # manual cool adjustment
+
+# Color profiles for different work
+huawei-display profile list
+huawei-display profile apply photo  # photo editing optimized
+huawei-display profile apply web    # web design (sRGB)
+huawei-display profile apply video  # video editing (DCI-P3 approx)
+huawei-display calibrate            # interactive calibration
+
+# High DPI scaling (MateBook X Pro has 3120x2080 display)
+huawei-display dpi auto             # auto-detect optimal scaling
+huawei-display dpi set 1.25         # set text scaling
+```
+
+### `huawei-backup` — Automated Backup & Sync
+
+Comprehensive backup solution for your MateBook.
+
+```bash
+# Install
+sudo cp huawei-backup /usr/local/bin/huawei-backup
+sudo chmod +x /usr/local/bin/huawei-backup
+
+# Initialize configuration
+huawei-backup config init
+
+# Manual backups
+huawei-backup backup full           # full backup (all configured dirs)
+huawei-backup backup quick         # quick backup (Documents, etc.)
+huawei-backup backup config        # config files only
+huawei-backup restore              # restore from backup
+
+# Cloud sync
+huawei-backup sync                 # sync to Nextcloud/Dropbox/etc.
+
+# System snapshots (requires timeshift)
+huawei-backup snapshot daily       # create daily snapshot
+huawei-backup snapshot list         # list available snapshots
+huawei-backup snapshot restore      # restore system snapshot
+
+# Automation
+huawei-backup schedule weekly      # schedule weekly backups
+huawei-backup daemon start          # start auto-backup daemon
+huawei-backup daemon status         # check daemon status
+
+# View/edit config
+huawei-backup config show
+huawei-backup config edit
+```
+
+Edit `~/.config/huawei-backup/config` to customize:
+- Backup directories
+- Cloud service (Nextcloud, Dropbox, etc.)
+- Retention policy
+- Auto-sync intervals
+
+---
+
+**Note:** Commands that write to hardware require `sudo`. Run any tool with `help` for full reference.
+
+Install all five tools at once with `./install-tools.sh`.
+
+---
+
+## Camera
+
+The MateBook X Pro 2024's webcam is a **GalaxyCore GC2607** (ACPI HID `GCTI2607`), not the OmniVision part its ACPI tables also advertise — `OVTI13B1` and `OVTI01AS` are both present but disabled (`status=0`). Two pieces are missing from a stock Ubuntu install:
+
+1. **No sensor driver.** The mainline kernel has no GC2607 V4L2 driver.
+2. **`ipu_bridge` doesn't know the sensor.** Its sensor table has no `GCTI2607` entry (still true as of upstream v7.0), so it never instantiates the sensor's I2C client and nothing probes.
+
+`camera/` supplies both as DKMS packages:
+
+```bash
+sudo ./camera/install.sh
+```
+
+| Package | What it does |
+|---------|--------------|
+| `gc2607` | V4L2 subdev driver — 1920x1080 @ 30fps, 10-bit RAW Bayer (GRBG), exposure + analogue gain |
+| `ipu-bridge-gc2607` | Rebuilds `ipu_bridge` with a `GCTI2607` entry, installed to `updates/` so it overrides the in-tree module without overwriting it |
+
+Both are registered with `AUTOINSTALL="yes"`, so **they rebuild automatically on every kernel upgrade**. This matters: the driver is version-locked to the kernel it was built against, and a manually-built `gc2607.ko` silently stops loading the moment you boot a new kernel — the camera then appears broken with no obvious cause.
+
+Under Secure Boot, DKMS signs both modules with the enrolled MOK key at `/var/lib/shim-signed/mok/`. `install.sh` checks for it and tells you how to enroll one if it's missing.
+
+`ipu-bridge-gc2607` fetches the `ipu-bridge.c` matching the kernel it's building for (~25 KB from the torvalds/linux mirror) and caches it under `/var/cache/ipu-bridge-gc2607/`, so it needs network access once per kernel series.
+
+Check and load the stack:
+
+```bash
+huawei camera status         # ACPI nodes, I2C client, modules, PMIC, media graph
+sudo huawei camera load      # load modules in dependency order + enable the media link
+huawei camera test           # capture one frame to /tmp/gc2607_test.raw
+```
+
+The driver source is vendored at `camera/gc2607/`, derived from
+[abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver) with one
+local change: `gc2607_probe()` sets `sd.fwnode`, without which the sensor probes
+but never joins the IPU6 media pipeline.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Download the script
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/huawei-matebook-setup.sh
+git clone https://github.com/homezloco/huawei-matebook-linux.git
+cd huawei-matebook-linux
 
-# Make executable
-chmod +x huawei-matebook-setup.sh
-
-# Run as root
+# One-shot hardware setup (touchpad, IPU6 modules, camera HAL)
 sudo ./huawei-matebook-setup.sh
+
+# Camera driver stack
+sudo ./camera/install.sh
+
+# Management CLIs
+./install-tools.sh
 ```
 
-The script is interactive — it will ask before making changes and offer a reboot at the end. It is safe to run multiple times; steps that are already complete are skipped.
+The setup script is interactive — it will ask before making changes and offer a reboot at the end. It is safe to run multiple times; steps that are already complete are skipped.
 
 ---
 
@@ -103,7 +276,7 @@ Adds the Dell/Canonical OEM archive (`dell.archive.canonical.com`) — a stable,
 - `libcamhal-ipu6epmtl` — Meteor Lake camera HAL plugin
 - `gstreamer1.0-icamera` — GStreamer source element for the IPU6 pipeline
 
-> **Note:** Even with the HAL installed, camera streaming is currently blocked by an `INT3472` GPIO conflict specific to the VGHH-XX ACPI tables. The HAL is ready and will work once the upstream kernel fix lands.
+> **Note:** The HAL alone is not sufficient on VGHH-XX — the GC2607 sensor also needs the driver stack in [`camera/`](#camera). Install that too.
 
 ### 4. Audio Check
 
@@ -116,14 +289,6 @@ Prints a full status table for all hardware components at the end of the run, in
 ---
 
 ## Known Issues
-
-### Webcam (INT3472 GPIO conflict)
-
-The camera hardware (`OV13B10` 13MP main + `OV01A1S` IR/Windows Hello) is present in ACPI but the `int3472-discrete` driver fails with `error -EBUSY: Failed to get GPIO` at boot. This prevents the sensor from being powered on and probed.
-
-This is an unresolved upstream kernel bug specific to the VGHH-XX ACPI tables. Track progress and add your details here:
-
-> https://github.com/intel/ipu6-drivers/issues/399
 
 ### Fingerprint Reader
 
@@ -195,15 +360,24 @@ cat /proc/bus/input/devices | grep -A5 GXTP
 libinput quirks list /dev/input/event4
 ```
 
-### Camera (HAL only — streaming blocked pending kernel fix)
+### Camera
 
 ```bash
-# Verify plugin is in place
-ls /usr/lib/libcamhal/plugins/
+# Full stack report — ACPI nodes, I2C client, modules, PMIC, media graph
+huawei camera status
 
-# Test pipeline (will fail with INT3472 error on VGHH-XX for now)
-sudo -E gst-launch-1.0 icamerasrc ! fakesink
+# Both DKMS packages should be "installed" for the running kernel
+dkms status | grep -E 'gc2607|ipu-bridge'
+
+# The patched bridge must win over the in-tree module
+modinfo ipu_bridge | grep filename        # expect .../updates/dkms/ipu-bridge.ko
+
+# Capture a frame
+sudo huawei camera load && huawei camera test
 ```
+
+If `huawei camera status` reports *"GC2607 I2C client NOT created"*, `ipu_bridge`
+is the stock one — rerun `sudo ./camera/install.sh` and reboot.
 
 ### Audio
 
@@ -227,7 +401,8 @@ PRs welcome for supporting additional models.
 
 ## References
 
-- [Intel IPU6 drivers issue #399 — VGHH-XX camera](https://github.com/intel/ipu6-drivers/issues/399)
+- [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver) — upstream of the GC2607 sensor driver vendored in `camera/gc2607/`
+- [Intel IPU6 drivers issue #399 — VGHH-XX camera](https://github.com/intel/ipu6-drivers/issues/399) — the original INT3472 report; superseded on this model by the GC2607 stack
 - [Ubuntu Wiki — IntelMIPICamera](https://wiki.ubuntu.com/IntelMIPICamera)
 - [Arch Linux Forums — GXTP7863 touchpad fix](https://bbs.archlinux.org/viewtopic.php?id=301467)
 - [Linux on Huawei MateBook X Pro 2024](https://daichendt.one/blog/huawei-matebook-x-pro-2024/)

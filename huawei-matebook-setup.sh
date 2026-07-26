@@ -53,7 +53,9 @@ detect_touchpad() {
 }
 
 detect_ipu6() {
-    lsmod | grep -q "intel_ipu6" && echo "loaded" || echo "absent"
+    # No `grep -q`: it exits on first match, SIGPIPEs lsmod, and under
+    # `set -o pipefail` the pipeline then reports failure despite matching.
+    [[ -d /sys/module/intel_ipu6 ]] && echo "loaded" || echo "absent"
 }
 
 # --- Banner ------------------------------------------------------------------
@@ -278,28 +280,28 @@ hardware_report() {
     fi
 
     # WiFi
-    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: no"; then
+    if rfkill list wifi 2>/dev/null | grep "Soft blocked: no" >/dev/null; then
         status_line "WiFi (Intel CNVi)" "OK" "Not blocked"
     else
         status_line "WiFi (Intel CNVi)" "UNKNOWN" "Check rfkill list"
     fi
 
     # Bluetooth
-    if hciconfig 2>/dev/null | grep -q "UP RUNNING"; then
+    if hciconfig 2>/dev/null | grep "UP RUNNING" >/dev/null; then
         status_line "Bluetooth" "OK" "UP RUNNING"
     else
         status_line "Bluetooth" "WARN" "Not detected or down"
     fi
 
     # Audio
-    if wpctl status 2>/dev/null | grep -q "Speaker"; then
+    if wpctl status 2>/dev/null | grep "Speaker" >/dev/null; then
         status_line "Audio (PipeWire)" "OK" "Speaker sink present"
     else
         status_line "Audio (PipeWire)" "WARN" "No speaker sink found"
     fi
 
     # IPU6 module
-    if lsmod | grep -q "intel_ipu6"; then
+    if [[ -d /sys/module/intel_ipu6 ]]; then
         status_line "Camera kernel module (IPU6)" "OK" "intel_ipu6 loaded"
     else
         status_line "Camera kernel module (IPU6)" "FAIL" "intel_ipu6 not loaded"
@@ -313,14 +315,14 @@ hardware_report() {
     fi
 
     # Camera streaming (INT3472)
-    if dmesg | grep -q "INT3472.*EBUSY"; then
+    if dmesg 2>/dev/null | grep "INT3472.*EBUSY" >/dev/null; then
         status_line "Camera streaming" "FAIL" "INT3472 GPIO conflict — upstream bug"
     else
         status_line "Camera streaming" "UNKNOWN" "Run: sudo -E gst-launch-1.0 icamerasrc ! fakesink"
     fi
 
     # Battery
-    if upower -e 2>/dev/null | grep -q battery; then
+    if upower -e 2>/dev/null | grep battery >/dev/null; then
         local pct
         pct=$(upower -i "$(upower -e | grep battery)" 2>/dev/null | grep percentage | awk '{print $2}')
         status_line "Battery" "OK" "${pct:-unknown}"

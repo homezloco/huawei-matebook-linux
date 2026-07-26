@@ -1,0 +1,32 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# ipu-bridge.c is fetched per kernel version by camera/ipu-bridge-gc2607/pre-build.sh
+camera/ipu-bridge-gc2607/ipu-bridge.c
+camera/ipu-bridge-gc2607/src-cache/
+
+# Editor / tooling
+tags
+*.swp
+*~
+.vscode/
+.idea/
+
+# Upstream working clone of https://github.com/abbood/gc2607-v4l2-driver.
+# Not part of this repo — the driver source we actually ship is vendored at
+# camera/gc2607/ so the camera stack stays self-contained and reviewable.
+/gc2607-v4l2-driver/
+
+# Local Claude Code settings
+.claude/settings.local.json
