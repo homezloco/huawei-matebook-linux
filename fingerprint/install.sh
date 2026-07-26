@@ -27,6 +27,7 @@ apt-get install -y -qq \
     "linux-headers-$(uname -r)" \
     cmake \
     libmbedtls-dev \
+    pkg-config \
     git
 
 # Fetch or refresh upstream sources.
@@ -40,11 +41,26 @@ else
     git clone --depth 1 "$UPSTREAM_URL" "$CACHE_DIR"
 fi
 
+# Patch upstream userspace source for the older MbedTLS shipped by Ubuntu 24.04.
+echo "Patching userspace source for Ubuntu MbedTLS compatibility…"
+# mbedtls_sha256 / mbedtls_sha512 are void-returning in MbedTLS 2.28.
+sed -i 's/if (mbedtls_sha256(buf, off, digest, 0) != 0) {/mbedtls_sha256(buf, off, digest, 0);\n    if (0) {/' \
+    "${CACHE_DIR}/userspace/src/algo/payload/provision.c"
+sed -i 's/if (mbedtls_sha512(bb010003_wb_data, bb010003_wb_data_len, digest, 1) != 0)/mbedtls_sha512(bb010003_wb_data, bb010003_wb_data_len, digest, 1);\n    if (0)/' \
+    "${CACHE_DIR}/userspace/src/algo/payload/provision.c"
+# TLS version helpers changed from min_version(major,minor) to min_tls_version(enum).
+sed -i 's/mbedtls_ssl_conf_min_tls_version(&e->conf, MBEDTLS_SSL_VERSION_TLS1_2);/mbedtls_ssl_conf_min_version(\&e->conf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3);/' \
+    "${CACHE_DIR}/userspace/src/tls/tls_engine_mbedtls.c"
+sed -i 's/mbedtls_ssl_conf_max_tls_version(&e->conf, MBEDTLS_SSL_VERSION_TLS1_2);/mbedtls_ssl_conf_max_version(\&e->conf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3);/' \
+    "${CACHE_DIR}/userspace/src/tls/tls_engine_mbedtls.c"
+
 # Build userspace tools.
 echo "Building userspace tools…"
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 cmake -S "${CACHE_DIR}/userspace" \
       -B "${CACHE_DIR}/build/userspace" \
-      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_MODULE_PATH="${SCRIPT_DIR}/cmake"
 cmake --build "${CACHE_DIR}/build/userspace" -j"$(nproc)"
 
 # Install kernel module via DKMS so it survives kernel upgrades.
@@ -52,6 +68,24 @@ echo "Installing gxfp kernel module via DKMS…"
 rm -rf "$DKMS_SRC"
 install -d "$DKMS_SRC"
 cp -a "${CACHE_DIR}/kernel/." "$DKMS_SRC/"
+
+# The upstream kernel/Makefile is an in-tree Kbuild file with no default target.
+# Add an out-of-tree wrapper so DKMS can build it directly.
+mv "$DKMS_SRC/Makefile" "$DKMS_SRC/Makefile.upstream"
+cat > "$DKMS_SRC/Makefile" <<'EOF'
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all: modules
+modules:
+	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_GXFP5130=m modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+EOF
+cat "$DKMS_SRC/Makefile.upstream" >> "$DKMS_SRC/Makefile"
+rm -f "$DKMS_SRC/Makefile.upstream"
 
 # The upstream Makefile uses obj-$(CONFIG_GXFP5130). For an out-of-tree DKMS
 # build CONFIG_GXFP5130 is unset, so force it to 'm' in the dkms.conf make line.

@@ -1292,19 +1292,36 @@ cmd_fingerprint() {
             need_root
             local psk_dir=/var/lib/fprintd/gxfp
             local psk="${psk_dir}/psk_raw32.bin"
+            local work
+            work=$(mktemp -d /tmp/gxfp-provision.XXXXXX)
+            # shellcheck disable=SC2064
+            trap 'rm -rf "${work}"' EXIT
+
+            if [[ -f "$psk" && "${1:-}" != "--replace" ]]; then
+                ok "PSK already exists at ${psk}"
+                dim "  Re-run with --replace to overwrite it (back it up first)."
+                exit 0
+            fi
+
+            if [[ ! -c /dev/gxfp ]]; then
+                die "/dev/gxfp is missing — the gxfp module is not loaded or the ACPI device is absent"
+            fi
+            if ! command -v gxfp_psk_tool &>/dev/null; then
+                die "gxfp_psk_tool not found — run first: sudo huawei fingerprint install"
+            fi
+
+            info "Provisioning TLS PSK for GXFP5130…"
+            gxfp_psk_tool --build-bb010002 "${work}/blob.bin" --out-psk-raw32 "${work}/psk_raw32.bin"
+            local size
+            size=$(stat -c %s "${work}/psk_raw32.bin" 2>/dev/null || echo 0)
+            [[ "$size" -eq 32 ]] || die "Generated PSK has invalid size (${size} bytes, expected 32)"
+
+            gxfp_psk_tool --upload-bb010002 "${work}/blob.bin" \
+                || die "Failed to upload BB010002 provisioning blob to the sensor"
 
             install -d -m 0700 "$psk_dir"
-            if [[ -f "$psk" ]]; then
-                ok "PSK already exists at ${psk}"
-            else
-                if ! command -v gxfp_psk_tool &>/dev/null; then
-                    die "gxfp_psk_tool not found — run first: sudo huawei fingerprint install"
-                fi
-                info "Provisioning TLS PSK for GXFP5130…"
-                gxfp_psk_tool generate > "$psk"
-                chmod 0600 "$psk"
-                ok "PSK written to ${psk}"
-            fi
+            install -m 0600 "${work}/psk_raw32.bin" "$psk"
+            ok "PSK written to ${psk}"
             dim "  Test capture: sudo gxfp_capture --psk-raw32 ${psk}"
             ;;
 
