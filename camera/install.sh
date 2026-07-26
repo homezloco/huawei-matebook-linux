@@ -234,7 +234,7 @@ for m in gc2607 ipu-bridge; do
 done
 
 # modprobe resolves through updates/ ahead of kernel/ — confirm that landed.
-resolved="$(modinfo -k "$KVER" ipu_bridge 2>/dev/null | awk '/^filename:/{print $2}')"
+resolved="$(modinfo -k "$KVER" ipu-bridge 2>/dev/null | awk '/^filename:/{print $2}')"
 if [[ "$resolved" == *updates/dkms* ]]; then
     ok "modprobe resolves ipu_bridge to our build"
     dim "$resolved"

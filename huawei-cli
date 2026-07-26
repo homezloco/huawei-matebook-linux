@@ -47,6 +47,30 @@ _isys_capture_node() {
                f && /device node name/ {print $NF; exit}'
 }
 
+# Find a v4l2loopback device that v4l2sink can write to. Some loopback
+# configurations (exclusive_caps=1 or a lingering v4l2-relayd) leave the
+# device advertising only capture; those are not usable as a sink.
+_v4l2loopback_sink() {
+    local dev info
+    for dev in /dev/video*; do
+        [[ -c "$dev" ]] || continue
+        info=$(v4l2-ctl -d "$dev" --info 2>/dev/null)
+        if ! echo "$info" | grep -q "Driver name.*: v4l2 loopback"; then
+            continue
+        fi
+        if command -v fuser >/dev/null && fuser -s "$dev" 2>/dev/null; then
+            continue
+        fi
+        # We need both directions: v4l2sink writes to it and apps read from it.
+        # exclusive_caps=1 only advertises one direction at a time, so reload.
+        if echo "$info" | grep -q "Video Output" && echo "$info" | grep -q "Video Capture"; then
+            echo "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Is kernel module $1 loaded? Checks /sys/module rather than piping lsmod into
 # `grep -q`: grep -q exits on its first match, which SIGPIPEs lsmod, and under
 # `set -o pipefail` the pipeline then returns 141 even though the module WAS
@@ -1040,6 +1064,7 @@ cmd_camera() {
             local elem pkg
             for elem in v4l2src:gstreamer1.0-plugins-good \
                         bayer2rgb:gstreamer1.0-plugins-bad \
+                        videoflip:gstreamer1.0-plugins-good \
                         frei0r-filter-coloradj-rgb:frei0r-plugins \
                         videoconvert:gstreamer1.0-plugins-base \
                         v4l2sink:gstreamer1.0-plugins-good; do
@@ -1059,14 +1084,29 @@ cmd_camera() {
                 die "Install the missing plugins: sudo apt install ${pkgs[*]}"
             fi
 
-            # Load v4l2loopback for the virtual camera sink
-            if ! mod_loaded v4l2loopback; then
-                if ! modprobe v4l2loopback devices=1 video_nr=10 \
-                        card_label="GC2607 RGB" exclusive_caps=1 2>/dev/null; then
+            # Load v4l2loopback for the virtual camera sink. Stop v4l2-relayd
+            # first; an Intel camera install may be holding the only loopback.
+            if pgrep -x v4l2-relayd >/dev/null 2>&1; then
+                warn "Stopping v4l2-relayd so the loopback can be used as output"
+                systemctl stop v4l2-relayd 2>/dev/null || true
+                killall v4l2-relayd 2>/dev/null || true
+            fi
+
+            local sink_node
+            sink_node=$(_v4l2loopback_sink)
+            if [[ -z "$sink_node" ]]; then
+                if mod_loaded v4l2loopback; then
+                    rmmod v4l2loopback 2>/dev/null || true
+                fi
+                if ! modprobe v4l2loopback devices=1 video_nr=-1 \
+                        card_label="GC2607 RGB" exclusive_caps=0 2>/dev/null; then
                     die "v4l2loopback not available — install: sudo apt install v4l2loopback-dkms"
                 fi
-                ok "v4l2loopback virtual camera at /dev/video10"
+                sink_node=$(_v4l2loopback_sink)
+                [[ -n "$sink_node" ]] \
+                    || die "v4l2loopback device did not appear"
             fi
+            ok "v4l2loopback virtual camera at ${sink_node}"
             local src_node
             src_node=$(_isys_capture_node)
             [[ -n "$src_node" ]] \
@@ -1074,7 +1114,7 @@ cmd_camera() {
             local r_gain="${1:-1.034}" g_gain="${2:-1.000}" b_gain="${3:-1.246}"
             info "Capture source: ${src_node}"
             info "Starting GStreamer pipeline with white balance R=${r_gain} G=${g_gain} B=${b_gain}"
-            info "Virtual camera: /dev/video10  (select 'GC2607 RGB' in OBS, Meet, etc.)"
+            info "Virtual camera: ${sink_node}  (select 'GC2607 RGB' in OBS, Meet, etc.)"
             dim  "  Ctrl+C to stop"
             echo ""
             # frei0r coloradj-rgb uses 0.0–1.0 scale (divide gain by 2.0)
@@ -1084,12 +1124,14 @@ cmd_camera() {
             b_f=$(python3 -c "print(${b_gain}/2.0)")
             gst-launch-1.0 -v \
                 v4l2src device="${src_node}" \
-                ! "video/x-raw,format=GRAY16_LE,width=1920,height=1080,framerate=30/1" \
+                ! "video/x-bayer,format=grbg10le,width=1920,height=1080,framerate=30/1" \
                 ! bayer2rgb \
-                ! frei0r-filter-coloradj-rgb r-gain="${r_f}" g-gain="${g_f}" b-gain="${b_f}" \
+                ! "video/x-raw,format=RGBA" \
+                ! videoflip method=vertical-flip \
+                ! frei0r-filter-coloradj-rgb r="${r_f}" g="${g_f}" b="${b_f}" \
                 ! videoconvert \
                 ! "video/x-raw,format=YUY2" \
-                ! v4l2sink device=/dev/video10
+                ! v4l2sink device="${sink_node}"
             ;;
 
         dmesg)

@@ -169,9 +169,9 @@ static int gc2607_read_reg(struct gc2607 *gc2607, u16 reg, u8 *val)
 	msgs[1].buf = val;
 
 	ret = i2c_transfer(client->adapter, msgs, 2);
-	if (ret < 0) {
+	if (ret != 2) {
 		dev_err(&client->dev, "Failed to read reg 0x%04x: %d\n", reg, ret);
-		return ret;
+		return ret < 0 ? ret : -EIO;
 	}
 
 	return 0;
@@ -188,9 +188,9 @@ static int gc2607_write_reg(struct gc2607 *gc2607, u16 reg, u8 val)
 	buf[2] = val;
 
 	ret = i2c_master_send(client, buf, 3);
-	if (ret < 0) {
+	if (ret != 3) {
 		dev_err(&client->dev, "Failed to write reg 0x%04x: %d\n", reg, ret);
-		return ret;
+		return ret < 0 ? ret : -EIO;
 	}
 
 	return 0;
@@ -454,6 +454,10 @@ static int gc2607_power_on(struct gc2607 *gc2607)
 	return 0;
 
 err_reg:
+	if (gc2607->reset_gpio)
+		gpiod_set_value_cansleep(gc2607->reset_gpio, 1);
+	if (gc2607->powerdown_gpio)
+		gpiod_set_value_cansleep(gc2607->powerdown_gpio, 1);
 	if (gc2607->supplies[0].supply)
 		regulator_bulk_disable(ARRAY_SIZE(gc2607->supplies), gc2607->supplies);
 	return ret;
@@ -470,7 +474,7 @@ static void gc2607_power_off(struct gc2607 *gc2607)
 
 	/* Assert reset if GPIO exists */
 	if (gc2607->reset_gpio)
-		gpiod_set_value_cansleep(gc2607->reset_gpio, 0);
+		gpiod_set_value_cansleep(gc2607->reset_gpio, 1);
 
 	/* Assert power-down if GPIO exists */
 	if (gc2607->powerdown_gpio)
@@ -528,6 +532,8 @@ static int gc2607_get_fmt(struct v4l2_subdev *sd,
 	struct v4l2_mbus_framefmt *mbus_fmt = &format->format;
 
 	/* Only support ACTIVE format (TRY not implemented) */
+	if (format->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -EINVAL;
 	mbus_fmt->width = gc2607->cur_mode->width;
 	mbus_fmt->height = gc2607->cur_mode->height;
 	mbus_fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
@@ -545,6 +551,10 @@ static int gc2607_set_fmt(struct v4l2_subdev *sd,
 	struct v4l2_mbus_framefmt *mbus_fmt = &format->format;
 	const struct gc2607_mode *mode;
 
+	/* Only support ACTIVE format (TRY not implemented) */
+	if (format->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -EINVAL;
+
 	/* Only support the default mode */
 	mode = &gc2607_modes[0];
 
@@ -554,11 +564,8 @@ static int gc2607_set_fmt(struct v4l2_subdev *sd,
 	mbus_fmt->field = V4L2_FIELD_NONE;
 	mbus_fmt->colorspace = V4L2_COLORSPACE_RAW;
 
-	/* Only support ACTIVE format (TRY not implemented) */
-	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
-		gc2607->cur_mode = mode;
-		gc2607->fmt = *mbus_fmt;
-	}
+	gc2607->cur_mode = mode;
+	gc2607->fmt = *mbus_fmt;
 
 	return 0;
 }
@@ -604,7 +611,7 @@ static int gc2607_s_stream(struct v4l2_subdev *sd, int enable)
 
 		dev_info(&client->dev, "Stream ON - sensor initialized\n");
 		gc2607->streaming = true;
-	} else {
+	} else if (gc2607->streaming) {
 		dev_info(&client->dev, "Stream OFF\n");
 		gc2607->streaming = false;
 		pm_runtime_put(&client->dev);
@@ -926,15 +933,15 @@ static int gc2607_probe(struct i2c_client *client)
 		goto err_power;
 	}
 
-	/* Power off after detection */
-	pm_runtime_put(dev);
-
 	/* Register async subdev for IPU6 integration */
 	ret = v4l2_async_register_subdev(&gc2607->sd);
 	if (ret) {
 		dev_err(dev, "Failed to register async subdev: %d\n", ret);
 		goto err_power;
 	}
+
+	/* Drop the reference acquired for detection; runtime PM will idle. */
+	pm_runtime_put(dev);
 
 	dev_info(dev, "GC2607 probe successful\n");
 	dev_info(dev, "  I2C address: 0x%02x\n", client->addr);
