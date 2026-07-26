@@ -37,6 +37,16 @@ need_root() {
 # Numeric guard: is $1 a non-negative integer?
 is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
+# Which /dev/videoN is the IPU6 ISYS capture node? Never assume /dev/video0:
+# the IPU6 registers dozens of nodes, their numbering shifts, and an unrelated
+# driver (v4l2loopback, a USB webcam) can easily hold video0 — capturing from
+# it silently yields a frame from the wrong device rather than an error.
+_isys_capture_node() {
+    media-ctl -d /dev/media0 -p 2>/dev/null \
+        | awk '/entity .*Intel IPU6 ISYS Capture 0 \(/ {f=1}
+               f && /device node name/ {print $NF; exit}'
+}
+
 # Is kernel module $1 loaded? Checks /sys/module rather than piping lsmod into
 # `grep -q`: grep -q exits on its first match, which SIGPIPEs lsmod, and under
 # `set -o pipefail` the pipeline then returns 141 even though the module WAS
@@ -984,15 +994,32 @@ cmd_camera() {
                 --set-v4l2 "'gc2607 5-0037':0 [fmt:SGRBG10_1X10/1920x1080 field:none]" \
                 --verbose 2>&1 | grep -E "Setting|error|ok" | sed 's/^/  /'
             echo ""
-            info "Capturing one frame to /tmp/gc2607_test.raw …"
-            if v4l2-ctl -d /dev/video0 \
+            local cap_node
+            cap_node=$(_isys_capture_node)
+            if [[ -z "$cap_node" ]]; then
+                die "Could not find the ISYS capture node in the media graph"
+            fi
+            info "Capturing one frame from ${cap_node} to /tmp/gc2607_test.raw …"
+
+            rm -f /tmp/gc2607_test.raw
+            v4l2-ctl -d "$cap_node" \
                 --set-fmt-video=width=1920,height=1080,pixelformat=BA10 \
                 --stream-mmap --stream-count=1 \
-                --stream-to=/tmp/gc2607_test.raw 2>&1; then
-                ok "Frame captured: /tmp/gc2607_test.raw"
+                --stream-to=/tmp/gc2607_test.raw 2>&1 | sed 's/^/  /' || true
+
+            # v4l2-ctl can print an error and still exit 0, so judge the
+            # capture by what actually landed on disk. 1920x1080 BA10 is
+            # 16 bits per pixel unpacked.
+            local want=$(( 1920 * 1080 * 2 )) got=0
+            [[ -f /tmp/gc2607_test.raw ]] && got=$(stat -c %s /tmp/gc2607_test.raw 2>/dev/null || echo 0)
+            if [[ "$got" -eq "$want" ]]; then
+                ok "Frame captured: /tmp/gc2607_test.raw (${got} bytes)"
                 dim "  Convert: ffmpeg -f rawvideo -pixel_format bayer_grbg10le -s 1920x1080 -i /tmp/gc2607_test.raw out.png"
+            elif [[ "$got" -gt 0 ]]; then
+                warn "Captured ${got} bytes, expected ${want} for 1920x1080 BA10"
+                dim "  The frame may be a different format or from the wrong node."
             else
-                err "Capture failed — check: huawei camera dmesg"
+                err "Capture failed — no data written. Check: huawei camera dmesg"
             fi
             ;;
 
@@ -1012,7 +1039,12 @@ cmd_camera() {
                 fi
                 ok "v4l2loopback virtual camera at /dev/video10"
             fi
+            local src_node
+            src_node=$(_isys_capture_node)
+            [[ -n "$src_node" ]] \
+                || die "Could not find the ISYS capture node in the media graph"
             local r_gain="${1:-1.034}" g_gain="${2:-1.000}" b_gain="${3:-1.246}"
+            info "Capture source: ${src_node}"
             info "Starting GStreamer pipeline with white balance R=${r_gain} G=${g_gain} B=${b_gain}"
             info "Virtual camera: /dev/video10  (select 'GC2607 RGB' in OBS, Meet, etc.)"
             dim  "  Ctrl+C to stop"
@@ -1023,7 +1055,7 @@ cmd_camera() {
             g_f=$(python3 -c "print(${g_gain}/2.0)")
             b_f=$(python3 -c "print(${b_gain}/2.0)")
             gst-launch-1.0 -v \
-                v4l2src device=/dev/video0 \
+                v4l2src device="${src_node}" \
                 ! "video/x-raw,format=GRAY16_LE,width=1920,height=1080,framerate=30/1" \
                 ! bayer2rgb \
                 ! frei0r-filter-coloradj-rgb r-gain="${r_f}" g-gain="${g_f}" b-gain="${b_f}" \
