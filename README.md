@@ -362,7 +362,12 @@ Prints a full status table for all hardware components at the end of the run, in
 
 ### Fingerprint Reader
 
-The Goodix fingerprint sensor on this model is connected via a proprietary interface and has no Linux driver. `libfprint` does not support it. There is no workaround at this time.
+The Goodix fingerprint sensor on this model is a **GXFP5130** (ACPI HID `GXFP5130`) connected over an eSPI mailbox rather than USB/I2C. It was long unsupported, but there is now active work:
+
+- **[Metrohan/gxfp5130-linux](https://github.com/Metrohan/gxfp5130-linux)** provides an out-of-tree kernel module, a `libfprint` fork, userspace tools, and PAM integration. It is reported working on the MateBook D16 2024 and the patch series explicitly lists the MateBook X Pro 2024.
+- A kernel patch series was submitted in July 2026: **[[PATCH 0/4] drivers/misc: add Goodix GXFP5130 eSPI fingerprint sensor driver](https://lore.kernel.org/linux-kernel/20260718080917.21893-1-metehangnen@gmail.com/)**.
+
+It is **not yet mainlined** and not packaged for Ubuntu, so it is still experimental and not integrated into this toolkit.
 
 ---
 
