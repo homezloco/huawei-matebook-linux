@@ -47,25 +47,104 @@ ok "curl present"
     || die "Kernel headers missing — sudo apt install linux-headers-${KVER}"
 ok "kernel headers for ${KVER}"
 
-# Secure Boot: unsigned modules are refused at load time, so catch a missing
-# MOK key here rather than after a successful-looking build.
-if command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -q "enabled"; then
-    if [[ -f /var/lib/shim-signed/mok/MOK.priv && -f /var/lib/shim-signed/mok/MOK.der ]]; then
-        ok "Secure Boot enabled — DKMS will sign with the enrolled MOK key"
-        if ! mokutil --test-key /var/lib/shim-signed/mok/MOK.der 2>/dev/null | grep -q "is already enrolled"; then
-            warn "MOK key exists but does not look enrolled"
-            dim "Enroll it: sudo mokutil --import /var/lib/shim-signed/mok/MOK.der"
-            dim "then reboot and choose 'Enroll MOK' in the blue MOK manager screen."
-        fi
-    else
-        warn "Secure Boot is on but no MOK key at /var/lib/shim-signed/mok/"
-        dim "Modules will build but refuse to load. Create and enroll a key first:"
-        dim "  sudo update-secureboot-policy --new-key"
-        dim "  sudo mokutil --import /var/lib/shim-signed/mok/MOK.der"
+# --- Secure Boot signing -----------------------------------------------------
+# Under Secure Boot an unsigned module builds and installs happily, then the
+# kernel refuses to load it at boot — so the camera stays broken with no error
+# from this script. Worse, DKMS defaults to signing with MOK.priv + MOK.der,
+# and a machine can easily end up with several MOK generations where those two
+# are not a pair (kmodsign then fails with "key values mismatch" mid-build).
+# So: find which certificate actually matches the private key, confirm it is
+# enrolled, and point DKMS at it explicitly.
+MOK_DIR=/var/lib/shim-signed/mok
+MOK_KEY="${MOK_DIR}/MOK.priv"
+DKMS_MOK_CONF=/etc/dkms/framework.conf.d/huawei-matebook-mok.conf
+
+_priv_pub() { openssl rsa  -in "$1" -pubout            2>/dev/null; }
+_cert_pub() { openssl x509 -in "$1" -inform "$2" -pubkey -noout 2>/dev/null; }
+
+_cert_enrolled() {
+    # mokutil --test-key needs DER and prints "is already enrolled" on success
+    mokutil --test-key "$1" 2>/dev/null | grep "is already enrolled" >/dev/null
+}
+
+configure_signing() {
+    if ! command -v mokutil >/dev/null \
+       || ! mokutil --sb-state 2>/dev/null | grep "enabled" >/dev/null; then
+        ok "Secure Boot off (or mokutil absent) — no signing required"
+        return 0
     fi
-else
-    ok "Secure Boot off (or mokutil absent) — no signing required"
-fi
+
+    if [[ ! -f "$MOK_KEY" ]]; then
+        warn "Secure Boot is on but there is no signing key at ${MOK_KEY}"
+        dim "Modules will build but the kernel will refuse to load them."
+        dim "Create and enroll one, then re-run this script:"
+        dim "  sudo update-secureboot-policy --new-key"
+        dim "  sudo mokutil --import ${MOK_DIR}/MOK.der   # then reboot and Enroll MOK"
+        return 0
+    fi
+
+    local priv_pub match="" match_der=""
+    priv_pub="$(_priv_pub "$MOK_KEY")"
+    [[ -n "$priv_pub" ]] || die "Cannot read the private key ${MOK_KEY}"
+
+    # Test every certificate lying around against the private key.
+    local c fmt
+    for c in "${MOK_DIR}"/*.der "${MOK_DIR}"/*.pem "${MOK_DIR}"/*.crt; do
+        [[ -f "$c" ]] || continue
+        case "$c" in
+            *.der) fmt=DER ;;
+            *)     fmt=PEM ;;
+        esac
+        if [[ "$(_cert_pub "$c" "$fmt")" == "$priv_pub" ]]; then
+            match="$c"; break
+        fi
+    done
+
+    if [[ -z "$match" ]]; then
+        warn "No certificate in ${MOK_DIR} matches ${MOK_KEY}"
+        dim "DKMS signing will fail and the modules will not load under Secure Boot."
+        dim "Generate a fresh matching pair and enroll it:"
+        dim "  sudo update-secureboot-policy --new-key"
+        dim "  sudo mokutil --import ${MOK_DIR}/MOK.der   # then reboot and Enroll MOK"
+        return 0
+    fi
+    ok "Signing key matches $(basename "$match")"
+
+    # mokutil needs DER; make one if the matching cert is PEM.
+    if [[ "$match" == *.der ]]; then
+        match_der="$match"
+    else
+        match_der="${MOK_DIR}/MOK-dkms.der"
+        openssl x509 -in "$match" -outform DER -out "$match_der" 2>/dev/null \
+            || die "Could not convert $(basename "$match") to DER"
+        chmod 644 "$match_der"
+        dim "Wrote DER form for DKMS: ${match_der}"
+    fi
+
+    if _cert_enrolled "$match_der"; then
+        ok "Certificate is enrolled in the MOK list"
+    else
+        warn "$(basename "$match") matches the key but is NOT enrolled"
+        dim "Modules will be signed but still refused at boot. Enroll it:"
+        dim "  sudo mokutil --import ${match_der}"
+        dim "then reboot and choose 'Enroll MOK' (you will be asked for a password)."
+    fi
+
+    # Pin the pair for DKMS. framework.conf.d overrides framework.conf without
+    # editing a distro-managed file, and applies to the automatic rebuilds that
+    # run on future kernel upgrades too — not just this invocation.
+    mkdir -p "$(dirname "$DKMS_MOK_CONF")"
+    cat > "$DKMS_MOK_CONF" <<EOF
+# Written by camera/install.sh — huawei-matebook-linux
+# DKMS defaults to MOK.priv + MOK.der; on this machine those are from
+# different key generations and do not pair. Pin the matching, enrolled pair.
+mok_signing_key="${MOK_KEY}"
+mok_certificate="${match_der}"
+EOF
+    ok "Pinned DKMS signing pair in $(basename "$DKMS_MOK_CONF")"
+}
+
+configure_signing
 
 # --- Install source trees ----------------------------------------------------
 hdr "Installing DKMS sources"
@@ -75,7 +154,7 @@ for pkg in "${PACKAGES[@]}"; do
 
     # Drop any previous registration so a re-run picks up edited sources
     # instead of rebuilding the stale copy already in /usr/src.
-    if dkms status -m "$pkg" -v "$VERSION" 2>/dev/null | grep -q .; then
+    if [[ -n "$(dkms status -m "$pkg" -v "$VERSION" 2>/dev/null)" ]]; then
         info "Removing previous ${pkg}/${VERSION} registration"
         dkms remove -m "$pkg" -v "$VERSION" --all >/dev/null 2>&1 || true
     fi
@@ -118,8 +197,12 @@ for f in "$bridge" "${bridge%.ko}.ko.zst"; do
 done
 
 if [[ -f "$bridge" ]]; then
-    if { [[ "$bridge" == *.zst ]] && zstd -dc "$bridge" || cat "$bridge"; } \
-        | strings | grep -q GCTI2607; then
+    # Count matches rather than `grep -q`: -q exits on the first hit, which
+    # SIGPIPEs `strings`, and under `set -o pipefail` the pipeline then reports
+    # failure — this very check claimed the entry was missing when it was there.
+    hits="$({ [[ "$bridge" == *.zst ]] && zstd -dc "$bridge" || cat "$bridge"; } \
+        | strings | grep -c GCTI2607 || true)"
+    if [[ "${hits:-0}" -gt 0 ]]; then
         ok "ipu-bridge carries the GCTI2607 entry"
     else
         warn "ipu-bridge built but GCTI2607 not found in it"
@@ -127,6 +210,23 @@ if [[ -f "$bridge" ]]; then
 else
     warn "ipu-bridge module not found under updates/dkms"
 fi
+
+# A module that built fine but is unsigned will still be refused at boot under
+# Secure Boot, so surface that here rather than leaving it to a silent failure.
+for m in gc2607 ipu-bridge; do
+    mk="/lib/modules/${KVER}/updates/dkms/${m}.ko"
+    [[ -f "$mk" ]] || mk="${mk}.zst"
+    [[ -f "$mk" ]] || continue
+    sig="$({ [[ "$mk" == *.zst ]] && zstd -dc "$mk" || cat "$mk"; } \
+        | strings | grep -c "Module signature appended" || true)"
+    if [[ "${sig:-0}" -gt 0 ]]; then
+        ok "${m} is signed"
+    elif command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep "enabled" >/dev/null; then
+        err "${m} is UNSIGNED — Secure Boot will refuse to load it"
+    else
+        dim "  ${m} unsigned (fine: Secure Boot is off)"
+    fi
+done
 
 # modprobe resolves through updates/ ahead of kernel/ — confirm that landed.
 resolved="$(modinfo -k "$KVER" ipu_bridge 2>/dev/null | awk '/^filename:/{print $2}')"

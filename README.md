@@ -208,7 +208,16 @@ sudo ./camera/install.sh
 
 Both are registered with `AUTOINSTALL="yes"`, so **they rebuild automatically on every kernel upgrade**. This matters: the driver is version-locked to the kernel it was built against, and a manually-built `gc2607.ko` silently stops loading the moment you boot a new kernel — the camera then appears broken with no obvious cause.
 
-Under Secure Boot, DKMS signs both modules with the enrolled MOK key at `/var/lib/shim-signed/mok/`. `install.sh` checks for it and tells you how to enroll one if it's missing.
+Under Secure Boot, modules must be signed with an enrolled MOK key or the kernel refuses to load them — and an unsigned module still builds and installs without complaint, so the camera just stays dark with nothing in the log pointing at signing.
+
+DKMS defaults to signing with `MOK.priv` + `MOK.der`. If a machine has been through more than one key generation those two can be from *different* pairs, and `kmodsign` fails mid-build with `key values mismatch` while DKMS carries on and installs the module unsigned. `install.sh` handles this: it tests every certificate in `/var/lib/shim-signed/mok/` against the private key, converts the matching one to DER if needed, checks it's actually enrolled, and pins the pair in `/etc/dkms/framework.conf.d/huawei-matebook-mok.conf` — which also applies to the automatic rebuilds on future kernel upgrades. It then verifies both installed modules actually carry a signature.
+
+If it reports a certificate that matches but is **not enrolled**:
+
+```bash
+sudo mokutil --import /var/lib/shim-signed/mok/MOK-dkms.der
+# reboot, choose "Enroll MOK", enter the password you just set
+```
 
 `ipu-bridge-gc2607` fetches the `ipu-bridge.c` matching the kernel it's building for (~25 KB from the torvalds/linux mirror) and caches it under `/var/cache/ipu-bridge-gc2607/`, so it needs network access once per kernel series.
 
