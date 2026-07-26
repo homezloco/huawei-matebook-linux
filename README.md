@@ -184,7 +184,16 @@ Edit `~/.config/huawei-backup/config` to customize:
 
 **Note:** Commands that write to hardware require `sudo`. Run any tool with `help` for full reference.
 
-Install all five tools at once with `./install-tools.sh`.
+Install all five tools at once:
+
+```bash
+./install-tools.sh          # copy into /usr/local/bin
+./install-tools.sh --link   # symlink to this checkout (use when editing them)
+```
+
+Use `--link` if you plan to modify the tools. The default copies them, so an
+edit doesn't take effect until you re-run the installer — and a stale copy's
+output looks exactly like a fix that didn't work.
 
 ---
 
@@ -229,10 +238,42 @@ sudo huawei camera load      # load modules in dependency order + enable the med
 huawei camera test           # capture one frame to /tmp/gc2607_test.raw
 ```
 
+`camera test` captures one frame and validates it by size — 1920x1080 10-bit
+Bayer is exactly 4147200 bytes. Convert it to view:
+
+```bash
+ffmpeg -f rawvideo -pixel_format bayer_grbg10le -s 1920x1080 \
+       -i /tmp/gc2607_test.raw out.png
+```
+
+### Virtual camera for Meet / Zoom / OBS
+
+The sensor emits raw Bayer, which conferencing apps cannot consume directly.
+`huawei camera stream` demosaics it, applies white balance, and publishes an
+RGB stream to a v4l2loopback device that appears as **GC2607 RGB**:
+
+```bash
+sudo apt install gstreamer1.0-plugins-bad frei0r-plugins v4l2loopback-dkms
+huawei camera stream                    # default white balance
+huawei camera stream 1.10 1.00 1.30     # custom R G B gains
+```
+
+`bayer2rgb` comes from `gstreamer1.0-plugins-bad` and the colour filter from
+`frei0r-plugins`; neither is installed by default. The command checks every
+element it needs up front and names the missing package rather than failing
+with a bare GStreamer error.
+
+### Notes
+
 The driver source is vendored at `camera/gc2607/`, derived from
 [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver) with one
 local change: `gc2607_probe()` sets `sd.fwnode`, without which the sensor probes
 but never joins the IPU6 media pipeline.
+
+The capture node is **not** `/dev/video0`. The IPU6 registers dozens of video
+nodes and v4l2loopback commonly takes `video0`; the tools resolve the real node
+from the media graph (`/dev/video1` on this machine). Note that `gc2607 5-0037`
+as shown by `media-ctl` is a V4L2 subdev name, not a device path.
 
 ---
 
@@ -245,11 +286,15 @@ cd huawei-matebook-linux
 # One-shot hardware setup (touchpad, IPU6 modules, camera HAL)
 sudo ./huawei-matebook-setup.sh
 
-# Camera driver stack
+# Camera driver stack (DKMS — survives kernel upgrades)
 sudo ./camera/install.sh
 
 # Management CLIs
 ./install-tools.sh
+
+# Reboot, then confirm the camera came up
+huawei camera status
+huawei camera test
 ```
 
 The setup script is interactive — it will ask before making changes and offer a reboot at the end. It is safe to run multiple times; steps that are already complete are skipped.
@@ -385,14 +430,34 @@ modinfo ipu_bridge | grep filename        # expect .../updates/dkms/ipu-bridge.k
 sudo huawei camera load && huawei camera test
 ```
 
-If `huawei camera status` reports *"GC2607 I2C client NOT created"*, `ipu_bridge`
-is the stock one — rerun `sudo ./camera/install.sh` and reboot.
+If `huawei camera status` reports *"GC2607 is waiting for a supplier"*,
+`ipu_bridge` is the stock one — rerun `sudo ./camera/install.sh` and reboot.
+A healthy stack reports *"GC2607 wired up and bound to gc2607"*.
 
 ### Audio
 
 ```bash
 wpctl status
 ```
+
+---
+
+## Development
+
+Everything is Bash with `set -euo pipefail`; there is no build step or test
+suite. Install with `./install-tools.sh --link` so edits take effect
+immediately, and sanity-check changes with:
+
+```bash
+bash -n huawei-cli && ./huawei-cli status && echo $?   # expect 0
+```
+
+[`CLAUDE.md`](CLAUDE.md) documents the shell hazards that have caused real bugs
+in this repo — `pipefail` inverting `grep -q` checks, commands that exit
+non-zero while succeeding, `[[ -f glob* ]]` never matching, and why
+`/dev/video0` must never be hardcoded. Worth reading before adding a hardware
+detection check, since each of those shipped as a check that confidently
+reported the opposite of reality.
 
 ---
 
