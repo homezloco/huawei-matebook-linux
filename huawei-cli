@@ -1031,6 +1031,34 @@ cmd_camera() {
             if ! command -v gst-launch-1.0 &>/dev/null; then
                 die "gst-launch-1.0 not found — install: sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good"
             fi
+
+            # Check the elements the pipeline needs before building it.
+            # gst-launch otherwise dies with a bare 'no element "bayer2rgb"',
+            # which does not say which package is missing. Map each element to
+            # the package that ships it.
+            local -a missing_pkgs=()
+            local elem pkg
+            for elem in v4l2src:gstreamer1.0-plugins-good \
+                        bayer2rgb:gstreamer1.0-plugins-bad \
+                        frei0r-filter-coloradj-rgb:frei0r-plugins \
+                        videoconvert:gstreamer1.0-plugins-base \
+                        v4l2sink:gstreamer1.0-plugins-good; do
+                pkg="${elem#*:}"; elem="${elem%%:*}"
+                if ! gst-inspect-1.0 "$elem" &>/dev/null; then
+                    err "  Missing GStreamer element: ${elem}"
+                    missing_pkgs+=("$pkg")
+                fi
+            done
+            if (( ${#missing_pkgs[@]} )); then
+                # dedupe while preserving order
+                local -a pkgs=() p
+                for p in "${missing_pkgs[@]}"; do
+                    [[ " ${pkgs[*]} " == *" $p "* ]] || pkgs+=("$p")
+                done
+                echo ""
+                die "Install the missing plugins: sudo apt install ${pkgs[*]}"
+            fi
+
             # Load v4l2loopback for the virtual camera sink
             if ! mod_loaded v4l2loopback; then
                 if ! modprobe v4l2loopback devices=1 video_nr=10 \
